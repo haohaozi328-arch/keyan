@@ -1,0 +1,139 @@
+# CI：把"我本地跑过"变成"每次提交都被强制跑一遍"。
+#
+# 三个 job：
+#   lint    代码风格与静态检查（几十秒，失败最快）
+#   test    真 MySQL + 真 Redis + 桩 LLM，跑全量 pytest
+#   image   构建 Docker 镜像，防止 Dockerfile 悄悄坏掉（漏 COPY、路径失效）
+#
+# 这里的 MySQL / Redis 参数要和 deploy/ 的收权策略对齐：
+# app 账号只有 DML，DDL 归 migrator。否则 test_db_contract 里
+# "运行时账号不能有 DDL 权限"那条断言在 CI 里会失真 —— 而它正是防注入的第二道墙。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一个分支的新提交会取消上一次运行：CI 排队的意义是"最新代码的结论"，
+  # 而不是把每一步都跑完
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 计时类断言在共享 runner 上更容易抖，把超时放宽一点不影响正确性
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Ruff check
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          # 必须允许 root 从容器外登录：runner 是通过映射端口连进来的
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: agent_chat
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --health-start-period=30s
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_USER: app
+      DB_PASSWORD: ci-app-pass
+      DB_NAME: agent_chat
+      DB_MIGRATION_USER: migrator
+      DB_MIGRATION_PASSWORD: ci-mig-pass
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ci-redis-pass
+      # 只为通过启动检查；CI 里没有任何真实签发
+      JWT_SECRET: ci-jwt-secret-not-for-production
+      LOG_FORMAT: text
+      LOG_LEVEL: INFO
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install
+        run: |
+          # 先装 lock（生产用的就是这一组），再补开发工具 ——
+          # 已装满足的包不会被 requirements-dev 里的范围再升一次
+          pip install -r requirements.lock
+          pip install -r requirements-dev.txt
+
+      # Redis 用 requirepass 起：应用把 REDIS_PASSWORD 为空视为"未配置"，
+      # 不设密码的话鉴权/限流/续传那些用例会整体 skip —— 绿灯但什么都没测。
+      - name: Start Redis
+        run: |
+          docker run -d --name redis-ci -p 6379:6379 \
+            redis:7.4-alpine redis-server --requirepass "$REDIS_PASSWORD"
+          for _ in $(seq 1 30); do
+            if docker exec redis-ci redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Redis 没有在 30 秒内就绪" >&2
+          docker logs redis-ci
+          exit 1
+
+      # 账号收权：与 deploy/mysql/initdb 的策略一致（DML 给 app，DDL 给 migrator）
+      - name: Prepare MySQL accounts
+        run: |
+          mysql -h 127.0.0.1 -uroot -proot <<'SQL'
+          CREATE USER 'app'@'%' IDENTIFIED BY 'ci-app-pass';
+          GRANT SELECT, INSERT, UPDATE, DELETE ON agent_chat.* TO 'app'@'%';
+          CREATE USER 'migrator'@'%' IDENTIFIED BY 'ci-mig-pass';
+          GRANT ALL PRIVILEGES ON agent_chat.* TO 'migrator'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+
+      # 表结构只能由 Alembic 建：跑通这条命令，等于验证了迁移脚本本身
+      - name: Migrate
+        run: alembic upgrade head
+
+      # 模型与库有没有漂移。改了模型却忘了生成迁移，只有这条能拦住 ——
+      # 单元测试用的是 SQLAlchemy 模型，永远自洽，看不出库里缺列。
+      # （表达式索引只能拿到近似签名，这一项的漂移检测不到，是已知限制。）
+      - name: Check migration drift
+        run: alembic check
+
+      - name: Test
+        run: pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t agent-chat:ci .

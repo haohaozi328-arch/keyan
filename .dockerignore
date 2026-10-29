@@ -1,0 +1,28 @@
+# 构建上下文越小越快，也避免把本地机密或无关文件塞进镜像层
+.git
+.github
+.workbuddy
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# 本地配置与证书绝不进镜像：密钥只通过运行时环境变量注入
+.env
+.env.*
+!.env.example
+.tmp-tls
+
+# 代码/配置已经显式 COPY，其余不进镜像
+tests
+docs
+web
+deploy
+*.md
+!requirements.txt

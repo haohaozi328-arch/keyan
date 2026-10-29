@@ -123,12 +123,56 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  # 应用本体。默认**不启动**（profile=app）：日常开发用 `uvicorn --reload`
+  # 跑在宿主机上，改一行代码不用重建镜像。只有验证"打包后能不能跑"时才用它：
+  #   docker compose --profile app up -d --build
+  #
+  # 为什么要在编排里跑一次：本机跑得起来 ≠ 镜像里跑得起来。漏 COPY 一个
+  # 目录（prompts/、alembic/）、写了只存在于宿主机的路径，都只有在容器里才暴露。
+  app:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-chat-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # .env 是唯一的配置来源，不在这里重复写业务配置
+    env_file: .env
+    environment:
+      # 容器内必须走服务名：.env 里的 127.0.0.1 是"宿主机视角"，
+      # 在容器里它指的是应用自己，连不上任何东西
+      DB_HOST: mysql
+      REDIS_HOST: redis
+      # 生产默认结构化日志；本地调试想肉眼读就把这行删掉
+      LOG_FORMAT: json
+    ports:
+      - "127.0.0.1:${PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=2).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # 停机时要等 SSE 生产者把 INTERRUPTED 写回库，默认 10s 不够
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 volumes:
   mysql-data:
     name: agent-chat-mysql-data
   redis-data:
     name: agent-chat-redis-data
-
 networks:
   default:
     name: agent-chat-net

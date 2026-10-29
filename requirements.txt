@@ -1,14 +1,25 @@
 # 运行时依赖（部署到生产只需要这一份）
 # 开发/测试依赖在 requirements-dev.txt，它 -r 引用本文件。
 #
-# 版本策略：下限卡 API 兼容线，上限只锁大版本（<1.0 这类），
-# 不逐个 pin 到补丁号 —— 那是 lock 文件的职责，不是手写清单的职责。
+# 版本策略：这里写**范围**（下限卡 API 兼容线，上限只锁大版本），
+# 精确版本由 `requirements.lock` 承担：
+#   * 生产镜像装 lock（每次构建结果一致）；
+#   * CI 装 range（让上游新版本先在那里暴露破坏性变更）；
+#   * 升级依赖是一个显式提交：改这里的范围 → 重新生成 lock → 看 CI 结论。
+#
+# 重新生成 lock（需要 uv）：
+#   uv pip compile requirements.txt --python-version 3.12 --universal \
+#       --no-header --output-file requirements.lock
 
 # ---- Web ----
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30
 pydantic-settings>=2.4
 python-dotenv>=1.0
+
+# 指标导出（/metrics）。纯 Python、无传递依赖；
+# 直方图分位与文本格式转义不值得自研
+prometheus-client>=0.20
 
 # SSE（帧编码 / ping / 断线检测 / 优雅停机）
 sse-starlette>=3.6
