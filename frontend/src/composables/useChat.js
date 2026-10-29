@@ -41,6 +41,7 @@ export function useChat(options = {}) {
   }
   function newChat() {
     if (state.busy || state.loading) return toast('请先停止接收，或等当前操作完成。');
+    state.dialog = '';
     viewVersion++; state.current = null; state.title = ''; state.messages = []; state.before = null; state.pending = null;
     banner(); closeSidebar();
   }
@@ -58,6 +59,7 @@ export function useChat(options = {}) {
   }
   async function openConversation(c, older = false) {
     if (state.busy || state.loading) return toast('请先停止接收，或等待消息加载完成。');
+    state.dialog = '';
     const view = ++viewVersion;
     state.loading = true;
     try {

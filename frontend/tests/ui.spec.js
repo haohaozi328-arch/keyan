@@ -38,13 +38,13 @@ test('Vue form opens login for anonymous questions, normalizes email and loads a
   const { wrapper, chat } = await setup((url, options) => { calls.push({ url, body: options.body && JSON.parse(options.body) }); if (url.endsWith('/auth/login')) return reply(auth); }, false);
   await wrapper.get('#question').setValue('未登录问题');
   await wrapper.get('#composer').trigger('submit');
-  expect(wrapper.get('#authDialog').element.open).toBe(true);
+  expect(wrapper.find('#authPage').exists()).toBe(true);
   expect(calls.some(c => c.url.endsWith('/chat/stream'))).toBe(false);
   await wrapper.get('#email').setValue('Student@Example.COM');
   await wrapper.get('#password').setValue('test-password');
   await wrapper.get('#authForm').trigger('submit'); await flushPromises();
   expect(calls.find(c => c.url.endsWith('/auth/login')).body.email).toBe('student@example.com');
-  expect(wrapper.get('#authDialog').element.open).toBe(false);
+  expect(wrapper.find('#authPage').exists()).toBe(false);
   expect(chat.loggedIn.value).toBe(true);
   expect(wrapper.get('.account-text strong').text()).toBe('同学');
   expect(wrapper.findAll('.history-item')).toHaveLength(1);

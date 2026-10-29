@@ -1,0 +1,14 @@
+/* 登录/注册是主区域里的一级页面，不是 <dialog> 弹窗：
+   人机验证的浮层由 SDK 挂在 body 下、靠 z-index 叠在内容之上，
+   一旦放进 showModal() 的弹窗（top layer），浮层就会被整块遮住。 */
+.auth-page { flex: 1; min-height: 0; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: clamp(20px, 6vh, 64px) 24px 48px; }
+.auth-card { position: relative; width: 100%; max-width: 420px; height: fit-content; padding: 32px; border: 1px solid #e8eaf0; border-radius: 20px; background: #fff; box-shadow: 0 16px 48px #18294b10; }
+.auth-card h2, .auth-card .modal-sub { text-align: center; }
+.auth-back { position: absolute; left: 8px; top: 8px; padding: 8px 10px; color: #8a90a0; }
+.auth-back:hover { background: #f1f3f8; color: #4a5366; }
+
+@media (max-width: 540px) {
+  .auth-page { padding: 14px 14px 32px; }
+  .auth-card { padding: 26px 20px; border-radius: 16px; }
+  .auth-back { left: 2px; top: 2px; }
+}
