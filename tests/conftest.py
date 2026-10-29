@@ -285,9 +285,12 @@ async def _flush_test_redis() -> None:
         decode_responses=True,
     )
     try:
-        stale = [key async for key in client.scan_iter(match="vc:*", count=500)]
-        if stale:
-            await client.delete(*stale)
+        # 会话级清一次：验证码/配额（vc:*）与对话闸门计数（chat:*）。
+        # 后者带 TTL，但额度键的 TTL 是两天 —— 不清的话测试之间会互相影响。
+        for pattern in ("vc:*", "chat:*"):
+            stale = [key async for key in client.scan_iter(match=pattern, count=500)]
+            if stale:
+                await client.delete(*stale)
     finally:
         await client.aclose()
 

@@ -48,6 +48,13 @@ class MessageItem(BaseModel):
         examples=["complete"],
     )
     model: str | None = Field(None, description="本消息使用的模型")
+    parent_message_id: str | None = Field(
+        None,
+        description=(
+            "重新生成的来源消息 ID。非空表示这条回答替代了哪一条 —— "
+            "前端据此把旧回答标成「已被重新生成」，而不是当成两轮对话。"
+        ),
+    )
     feedback: FeedbackRating | None = Field(
         None, description="当前用户的评价：up / down；null 表示没评价过"
     )

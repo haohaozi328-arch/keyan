@@ -91,6 +91,9 @@ class LLMService:
             temperature=settings.LLM_TEMPERATURE,
             timeout=settings.LLM_TIMEOUT_SECONDS,
             max_retries=settings.LLM_MAX_RETRIES,
+            # 输出上限。不设的话，一次跑飞的长回答能吃掉几万 token，
+            # 而用户通常看不到一半就离开了 —— 账单付了，价值没产生。
+            max_tokens=settings.LLM_MAX_TOKENS or None,
             base_url=settings.LLM_BASE_URL or None,
         )
         # 不拼 StrOutputParser：见模块 docstring，解析器会丢掉用量元信息

@@ -99,9 +99,19 @@ class User(Base):
 class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
-        # 会话列表的主查询：WHERE user_id=? ORDER BY last_message_at DESC
-        # DESC 索引让排序免掉 filesort
-        Index("idx_conv_user_recent", "user_id", text("last_message_at DESC")),
+        # 会话列表的主查询：
+        #   WHERE user_id=? AND deleted_at IS NULL
+        #   ORDER BY last_message_at DESC, id DESC
+        # 四列都进索引：前两列是等值条件，后两列直接喂给排序。
+        # 少了 deleted_at 就要回表过滤软删（翻 20 条可能扫几百行），
+        # 少了 id 则同毫秒的会话要靠 filesort 兜底。
+        Index(
+            "idx_conv_user_recent",
+            "user_id",
+            "deleted_at",
+            text("last_message_at DESC"),
+            text("id DESC"),
+        ),
         Index("idx_conv_status", "status", "last_message_at"),
         CheckConstraint("status IN (0, 1)", name="ck_conv_status"),
         {"comment": "对话"},
@@ -181,6 +191,9 @@ class Message(Base):
         CheckConstraint("feedback IN (0, 1, 2)", name="ck_msg_feedback"),
         # 差评巡检：WHERE feedback=2 ORDER BY feedback_at DESC 是运营侧最常用的查询
         Index("idx_msg_feedback", "feedback", "feedback_at"),
+        # 重新生成要问"这条回答有没有被替代"（相关 EXISTS 子查询），
+        # 没有索引就是每轮对话扫一遍消息表
+        Index("idx_msg_parent", "parent_message_id"),
         {"comment": "消息"},
     )
 
@@ -238,7 +251,7 @@ class Message(Base):
         String(64), default=None, comment="客户端幂等键"
     )
     parent_message_id: Mapped[int | None] = mapped_column(
-        SnowflakeID, default=None, comment="重新生成/分支的来源消息"
+        SnowflakeID, default=None, comment="被本条替代的回答 ID（重新生成时写入）"
     )
     created_at: Mapped[datetime] = mapped_column(
         Timestamp, default=utcnow, server_default=text("CURRENT_TIMESTAMP(3)")

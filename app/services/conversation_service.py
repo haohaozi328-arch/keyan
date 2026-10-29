@@ -37,6 +37,7 @@ from app.db.enums import MessageFeedback, MessageRole, MessageStatus
 from app.db.models import Conversation, Message, User
 from app.repositories import ConversationRepository, MessageRepository
 from app.schemas.chat import ChatMessage
+from app.services.context_budget import estimate_tokens, fit_history
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,7 @@ class ConversationService:
                 rows = await messages.recent_for_context(
                     conversation_id=conv.id, limit=self._settings.CHAT_CONTEXT_MESSAGES
                 )
-                history = _to_chat_messages(rows)
+                history = self._fit(_to_chat_messages(rows), question=message)
 
             seq = await messages.next_seq(conv.id)
             user_message = messages.add(
@@ -157,6 +158,88 @@ class ConversationService:
             )
             await session.commit()
             return context
+
+    def _fit(self, history: list[ChatMessage], *, question: str) -> list[ChatMessage]:
+        """按 token 预算裁历史，本轮提问先占掉自己那份。
+
+        条数上限（`CHAT_CONTEXT_MESSAGES`）只是兜底：单条消息就能到 8000 字符，
+        20 条最坏是 4 万 token，既贵又可能超窗口。真正决定成本上限的是预算。
+        """
+        budget = max(0, self._settings.CHAT_CONTEXT_MAX_TOKENS - estimate_tokens(question))
+        kept, dropped = fit_history(history, budget_tokens=budget)
+        if dropped:
+            logger.info("上下文超预算，丢弃最旧的 %d 条（可用预算 %d token）", dropped, budget)
+        return kept
+
+    async def prepare_regeneration(
+        self,
+        *,
+        user: User,
+        message_id: int,
+        model: str,
+        prompt_id: str,
+        prompt_version: int,
+    ) -> tuple[TurnContext, str]:
+        """重新生成：**不重复写用户消息**，只在末尾追加一条新的助手消息。
+
+        为什么保留旧回答而不是覆盖：
+            用户点"重新生成"是想比较，不是想销毁证据；旧回答还是评价与 badcase
+            的载体。新消息用 `parent_message_id` 指向被替代的那条，
+            上下文加载时据此把旧回答排除 —— 同一个问题只留一份答案进 prompt，
+            否则模型会看到"问一次答两次"，越聊越偏。
+
+        为什么归档查找上一条用户消息而不是 `seq - 1`：
+            重新生成之后，被替代的回答还留在原 seq 上，"上一条"就成了另一份回答。
+        """
+        async with self._session_factory() as session:
+            messages = MessageRepository(session)
+            conversations = ConversationRepository(session)
+
+            target = await messages.get_owned(user_id=user.id, message_id=message_id)
+            if target is None or target.role is not MessageRole.ASSISTANT:
+                # 只允许重答助手消息：用户消息没有对应的生成过程
+                raise NotFoundError("消息不存在")
+
+            # for_update：和普通一轮一样，seq 必须在锁内分配
+            conv = await conversations.get(
+                user_id=user.id, conversation_id=target.conversation_id, for_update=True
+            )
+            if conv is None:
+                raise NotFoundError("会话不存在")
+
+            question = await messages.last_user_before(conversation_id=conv.id, seq=target.seq)
+            if question is None or not question.content:
+                raise InvalidParamError("找不到对应的提问，无法重新生成")
+
+            rows = await messages.context_before(
+                conversation_id=conv.id,
+                seq=question.seq,
+                limit=self._settings.CHAT_CONTEXT_MESSAGES,
+            )
+            history = self._fit(_to_chat_messages(rows), question=question.content)
+
+            seq = await messages.next_seq(conv.id)
+            assistant = messages.add(
+                conversation_id=conv.id,
+                user_id=user.id,
+                seq=seq,
+                role=MessageRole.ASSISTANT,
+                content="",
+                status=MessageStatus.STREAMING,
+                model=model,
+                parent_message_id=target.id,
+            )
+            # 只 +1：问题没有重写，用户看到的还是同一句话
+            conversations.touch(conv, new_messages=1)
+
+            context = TurnContext(
+                conversation_id=conv.id,
+                assistant_message_id=assistant.id,
+                history=history,
+                title=conv.title,
+            )
+            await session.commit()
+            return context, question.content
 
     # ------------------------------------------------------------------ 收尾
 

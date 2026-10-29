@@ -20,8 +20,13 @@ from app.db.enums import UserStatus
 from app.db.models import User
 from app.repositories import UserRepository
 from app.services.auth_service import AuthService
+from app.services.chat_throttle import ChatThrottle
 from app.services.conversation_service import ConversationService
-from app.services.exceptions import AuthNotConfiguredError, StreamNotConfiguredError
+from app.services.exceptions import (
+    AuthNotConfiguredError,
+    ChatGateUnavailableError,
+    StreamNotConfiguredError,
+)
 from app.services.login_throttle import LoginThrottle
 from app.services.mail_service import MailService, get_mail_service
 from app.services.stream_hub import StreamBuffer
@@ -146,3 +151,16 @@ def get_stream_buffer(
     if not settings.redis_configured:
         raise StreamNotConfiguredError()
     return StreamBuffer(get_redis(), settings.SSE_RESUME_TTL_SECONDS)
+
+
+def get_chat_throttle(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ChatThrottle:
+    """对话成本闸门。
+
+    没配 Redis 时**不降级成"不限制"**：那样一来，出故障时把 Redis 摘掉
+    就等于静默关掉了限流，而没有任何报警。宁可 503 说清楚。
+    """
+    if not settings.redis_configured:
+        raise ChatGateUnavailableError()
+    return ChatThrottle(get_redis(), settings)

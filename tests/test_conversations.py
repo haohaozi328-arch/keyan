@@ -304,3 +304,50 @@ def test_anonymous_cannot_chat(auth_client: TestClient, stub_llm) -> None:
     assert response.json()["code"] == 11401
     # 被拦在最前面：既没有调模型，也没有写库
     assert stub.calls == []
+
+
+def test_regenerate_keeps_old_answer_and_links_parent(
+    auth_client: TestClient, stub_mail, make_email, stub_llm
+) -> None:
+    """重新生成：追加一条新回答、不重复写提问、旧回答保留并建立替代关系。
+
+    旧回答必须留着 —— 用户点重答是想比较，而且它还是评价与 badcase 的载体；
+    但**上下文里只能有新的那份**，否则模型会看到"问一次、答两次"。
+    """
+    stub_llm(answer="第一版回答")
+    headers = _signup(auth_client, stub_mail, make_email())
+    first = _chat(auth_client, headers, "介绍一下 LangChain")
+
+    stub_llm(answer="第二版回答")
+    response = auth_client.post(f"{CHAT}/regenerate/{first['message_id']}", headers=headers)
+    assert response.status_code == 200, response.text
+    frames = _parse_sse(response.text)
+    assert frames[0][0] == "start"
+    assert (
+        "".join(json.loads(data)["delta"] for event, data in frames if event == "delta")
+        == "第二版回答"
+    )
+
+    messages = _messages(auth_client, headers, first["conversation_id"])
+    # 提问没有被重写，只在末尾多了一条回答
+    assert [m["role"] for m in messages] == ["user", "assistant", "assistant"]
+    assert [m["seq"] for m in messages] == [1, 2, 3]
+    assert messages[1]["content"] == "第一版回答"
+    assert messages[1]["parent_message_id"] is None
+    # 新回答指向被替代的那条：前端据此把旧回答标成「已被重新生成」
+    assert messages[2]["parent_message_id"] == first["message_id"]
+    assert messages[2]["content"] == "第二版回答"
+
+    # 下一轮的上下文里只应出现新回答
+    third_stub = stub_llm(answer="第三轮回答")
+    _chat(
+        auth_client,
+        headers,
+        "继续",
+        conversation_id=first["conversation_id"],
+    )
+    history = third_stub.calls[0]["history"]
+    assert history == [
+        ("user", "介绍一下 LangChain"),
+        ("assistant", "第二版回答"),
+    ]

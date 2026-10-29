@@ -166,6 +166,8 @@ def _message_item(message: Message) -> MessageItem:
         content=message.content or "",
         status=_STATUS_NAMES.get(message.status, "complete"),
         model=message.model,
+        # 雪花 ID 一律转字符串，理由同其他地方：JS 的数字精度只有 2^53
+        parent_message_id=str(message.parent_message_id) if message.parent_message_id else None,
         feedback=_FEEDBACK_NAMES.get(message.feedback),
         feedback_reason=message.feedback_reason,
         feedback_at=message.feedback_at,

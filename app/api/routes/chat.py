@@ -25,6 +25,12 @@ SSE 仍有两种错误通道：
 落库时机：`event=done` **之前**。客户端看到 done 通常会立刻刷新会话列表，
 先发 done 再写库会出现"回答完了但列表里没有这条"。这条规则现在由生产者
 保证（它先写库、再追加 done 帧），与连接是否还在无关。
+
+成本闸门
+--------
+四个对话入口（一次性 / 流式 / 续传 / 重新生成）里，会真正产生 token 成本的
+是前两个和重新生成；续传只读缓冲，不重新生成，所以不占名额。
+闸门在**写库之前**拦：被限流的请求不该在会话里留下两条空消息。
 """
 
 import asyncio
@@ -37,6 +43,7 @@ from sse_starlette import EventSourceResponse
 
 from app.api.deps import (
     CurrentUser,
+    get_chat_throttle,
     get_conversation_service,
     get_stream_buffer,
 )
@@ -45,6 +52,7 @@ from app.core.errors import InvalidParamError, NotFoundError
 from app.core.response import ApiResponse, ok
 from app.db.models import User
 from app.schemas.chat import ChatRequest, ChatResponse, ChatStatusResponse
+from app.services.chat_throttle import ChatThrottle, ChatTicket
 from app.services.conversation_service import ConversationService, TurnContext
 from app.services.exceptions import LLMUpstreamError, ServiceError, StreamExpiredError
 from app.services.llm_service import LLMService, get_llm_service
@@ -76,6 +84,7 @@ _STREAM_ID_PATTERN = re.compile(r"^\d{1,20}-\d{1,20}$")
     ),
     responses={
         401: {"description": "未登录或令牌失效"},
+        429: {"description": "触发成本闸门（频率 / 并发 / 额度）"},
         503: {"description": "LLM 未配置"},
     },
 )
@@ -84,15 +93,21 @@ async def chat(
     user: CurrentUser,
     service: Annotated[LLMService, Depends(get_llm_service)],
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
+    throttle: Annotated[ChatThrottle, Depends(get_chat_throttle)],
 ) -> ApiResponse[ChatResponse]:
-    context = await _prepare(conversations, user, payload, service)
+    # 先取名额再写库：被限流的请求不该在会话里留下两条空消息
+    ticket = await throttle.acquire(user_id=user.id)
     try:
-        result = await service.achat(payload, context.history)
-    except (LLMUpstreamError, ServiceError) as exc:
-        # 失败也要落一条 FAILED：否则会话里只剩用户那句话，
-        # 列表显示"共 2 条"却只查得到 1 条，统计和实际永远对不上
-        await conversations.fail_turn(context, reason=exc.message)
-        raise
+        context = await _prepare(conversations, user, payload, service)
+        try:
+            result = await service.achat(payload, context.history)
+        except (LLMUpstreamError, ServiceError) as exc:
+            # 失败也要落一条 FAILED：否则会话里只剩用户那句话，
+            # 列表显示"共 2 条"却只查得到 1 条，统计和实际永远对不上
+            await conversations.fail_turn(context, reason=exc.message)
+            raise
+    finally:
+        await throttle.release(ticket)
 
     usage = result.usage or {}
     await conversations.complete_turn(
@@ -100,6 +115,9 @@ async def chat(
         answer=result.answer,
         prompt_tokens=usage.get("prompt_tokens"),
         completion_tokens=usage.get("completion_tokens"),
+    )
+    await throttle.record_tokens(
+        user.id, (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
     )
     return ok(
         ChatResponse(
@@ -138,35 +156,33 @@ async def chat_stream(
     conversations: Annotated[ConversationService, Depends(get_conversation_service)],
     buffer: Annotated[StreamBuffer, Depends(get_stream_buffer)],
     settings: Annotated[Settings, Depends(get_settings)],
+    throttle: Annotated[ChatThrottle, Depends(get_chat_throttle)],
 ) -> EventSourceResponse:
     # 配置缺失属于请求前置条件，必须在响应头下发前拦掉。
     # 这里抛出的 AppError 会被全局处理器接住 —— 此时流还没开始。
     service.ensure_configured()
 
-    # 归属校验、上下文加载、消息占位全部前移到这里：
-    # 一旦开始往客户端写字节，这些错误就只能变成流里的 error 帧，
-    # 前端拿不到 404/401，只知道"聊到一半失败了"
-    context = await _prepare(conversations, user, payload, service)
-    turn_id = context.assistant_message_id
-    if turn_id is None:  # 仅类型收窄：prepare_turn 一定写了占位
-        raise RuntimeError("对话上下文缺少助手消息 ID")
-
-    # 先把心跳立起来再起任务：消费者可能抢在生产者之前读第一帧，
-    # 那时候如果没有 beat，会被判成"生产者已死"
-    await buffer.start(turn_id, settings.SSE_RESUME_GRACE_SECONDS)
-
-    runner = TurnRunner(
-        service=service,
-        conversations=conversations,
-        context=context,
-        payload=payload,
-        history=context.history,
-        buffer=buffer,
-        settings=settings,
-    )
-    _registry(request).add(turn_id, asyncio.create_task(runner.run(), name=f"chat-turn-{turn_id}"))
-
-    return _stream_response(request, buffer, context, settings, after=STREAM_START)
+    ticket = await throttle.acquire(user_id=user.id)
+    try:
+        # 归属校验、上下文加载、消息占位全部前移到这里：
+        # 一旦开始往客户端写字节，这些错误就只能变成流里的 error 帧，
+        # 前端拿不到 404/401，只知道"聊到一半失败了"
+        context = await _prepare(conversations, user, payload, service)
+        return await _launch_turn(
+            request,
+            context=context,
+            payload=payload,
+            service=service,
+            conversations=conversations,
+            buffer=buffer,
+            settings=settings,
+            throttle=throttle,
+            ticket=ticket,
+        )
+    except Exception:
+        # 名额在成功交给后台任务之后才归后台管；这条路径没交出去，必须自己还
+        await throttle.release(ticket)
+        raise
 
 
 @router.get(
@@ -218,6 +234,127 @@ async def resume_stream(
     # 先续客户端心跳，让还在跑的生产者知道"人回来了"，别把生成停掉
     await buffer.touch_consumer(turn_id, settings.SSE_RESUME_GRACE_SECONDS)
     return _stream_response(request, buffer, context, settings, after=after)
+
+
+@router.post(
+    "/regenerate/{message_id}",
+    summary="重新生成一条回答（SSE 流式）",
+    description=(
+        "需要登录。对指定的助手消息重新生成一次回答，帧格式与 /chat/stream 完全一致。"
+        "**不会重复写入用户提问**：新回答作为一条新消息追加在末尾，"
+        "原回答保留下来（可以对比，也保住了它的评价与 badcase 记录）。"
+        "新消息的 parent_message_id 指向被替代的那条，之后的上下文只使用新回答。"
+    ),
+    response_class=EventSourceResponse,
+    responses={
+        200: {"content": {"text/event-stream": {}}, "description": "SSE 事件流"},
+        401: {"description": "未登录或令牌失效"},
+        404: {"description": "消息不存在或不属于当前用户"},
+        429: {"description": "触发成本闸门（频率 / 并发 / 额度）"},
+        503: {"description": "LLM 未配置或 Redis 未配置"},
+    },
+)
+async def regenerate_stream(
+    request: Request,
+    message_id: str,
+    user: CurrentUser,
+    service: Annotated[LLMService, Depends(get_llm_service)],
+    conversations: Annotated[ConversationService, Depends(get_conversation_service)],
+    buffer: Annotated[StreamBuffer, Depends(get_stream_buffer)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    throttle: Annotated[ChatThrottle, Depends(get_chat_throttle)],
+) -> EventSourceResponse:
+    # 重新生成同样要花一次完整的 token，闸门与 /chat/stream 一模一样
+    service.ensure_configured()
+    prompt = service.prompt
+
+    ticket = await throttle.acquire(user_id=user.id)
+    try:
+        context, question = await conversations.prepare_regeneration(
+            user=user,
+            message_id=_parse_message_id(message_id),
+            model=service.model,
+            prompt_id=prompt.id,
+            prompt_version=prompt.version,
+        )
+        return await _launch_turn(
+            request,
+            context=context,
+            # 复用原来的提问：重新生成的是"同一个问题"的答案
+            payload=ChatRequest(message=question),
+            service=service,
+            conversations=conversations,
+            buffer=buffer,
+            settings=settings,
+            throttle=throttle,
+            ticket=ticket,
+        )
+    except Exception:
+        await throttle.release(ticket)
+        raise
+
+
+async def _launch_turn(
+    request: Request,
+    *,
+    context: TurnContext,
+    payload: ChatRequest,
+    service: LLMService,
+    conversations: ConversationService,
+    buffer: StreamBuffer,
+    settings: Settings,
+    throttle: ChatThrottle,
+    ticket: ChatTicket,
+) -> EventSourceResponse:
+    """起生产者任务并返回 SSE 响应。三个会花 token 的入口共用这一段。"""
+    turn_id = context.assistant_message_id
+    if turn_id is None:  # 仅类型收窄：prepare_* 一定写了占位
+        raise RuntimeError("对话上下文缺少助手消息 ID")
+
+    # 先把心跳立起来再起任务：消费者可能抢在生产者之前读第一帧，
+    # 那时候如果没有 beat，会被判成"生产者已死"
+    await buffer.start(turn_id, settings.SSE_RESUME_GRACE_SECONDS)
+
+    runner = TurnRunner(
+        service=service,
+        conversations=conversations,
+        context=context,
+        payload=payload,
+        history=context.history,
+        buffer=buffer,
+        settings=settings,
+    )
+    task = asyncio.create_task(_run_turn(runner, throttle, ticket), name=f"chat-turn-{turn_id}")
+    # 必须留下强引用：asyncio 只保留弱引用，没人引用时任务会被 GC 掉，
+    # 表现是"回答说到一半就停了"，且没有任何异常
+    _registry(request).add(turn_id, task)
+    return _stream_response(request, buffer, context, settings, after=STREAM_START)
+
+
+async def _run_turn(runner: TurnRunner, throttle: ChatThrottle, ticket: ChatTicket) -> None:
+    """跑生成，并在**任何**退出路径上归还名额、记当日用量。
+
+    收尾用 shield 包住：停机时任务会被 cancel，此时直接 await 会立刻被
+    再次打断，名额只能等 TTL（默认 15 分钟）自然回收 —— 这期间用户会
+    一直看到"同时进行的对话不能超过 N 条"。
+    """
+    try:
+        await runner.run()
+    finally:
+        try:
+            await asyncio.shield(_settle_turn(throttle, ticket, runner))
+        except asyncio.CancelledError:
+            pass
+
+
+async def _settle_turn(throttle: ChatThrottle, ticket: ChatTicket, runner: TurnRunner) -> None:
+    try:
+        await throttle.release(ticket)
+        await throttle.record_tokens(ticket.user_id, runner.total_tokens)
+    except Exception:  # noqa: BLE001
+        # 记账失败不该改变这一轮的终态：消息已经写进库了，
+        # 这里再抛只会让人误以为"生成失败"
+        logger.exception("归还对话名额 / 记录用量失败 user=%s", ticket.user_id)
 
 
 def _stream_response(
