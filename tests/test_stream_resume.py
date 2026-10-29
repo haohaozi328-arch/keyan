@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 
+import pytest
 from app.core.config import Settings
 from app.db.enums import MessageStatus
 from app.schemas.chat import ChatRequest
@@ -210,7 +211,9 @@ def test_resume_from_last_event_id(
 
     rest = _resume(auth_client, auth_headers, ids["message_id"], last_id)
 
-    assert rest[0]["event"] == "start", "续传也要给 start，客户端可能已经丢了它"
+    # 带游标续读**不重发 start**：客户端既然能拿出 id，就说明它收到过帧，
+    # 会话/消息 ID 早已知道。服务端能判断的事不该推给客户端幂等。
+    assert rest[0]["event"] == "delta"
     assert _events(rest)[-2:] == ["meta", "done"]
     assert seen + _text(rest) == answer
 
@@ -229,6 +232,8 @@ def test_resume_without_id_replays_from_beginning(
     frames, ids = _start(auth_client, auth_headers, "你好")
     replay = _resume(auth_client, auth_headers, ids["message_id"], None)
 
+    # 没有游标 = 从头重放，这时候才需要 start 帧
+    assert replay[0]["event"] == "start"
     assert _text(replay) == answer
     assert _events(replay)[-2:] == ["meta", "done"]
 
@@ -244,8 +249,8 @@ def test_resume_after_done_ends_immediately(
 
     tail = _resume(auth_client, auth_headers, ids["message_id"], done_id)
 
-    # 只补了 start 和 done：内容客户端已经有了
-    assert _events(tail) == ["start", "done"]
+    # 只补了一个 done：内容客户端已经有了，start 也不需要（有游标就没重发）
+    assert _events(tail) == ["done"]
 
 
 def test_resume_expired_buffer_returns_410(
@@ -468,3 +473,88 @@ def test_generation_stops_when_nobody_listens(test_redis_url: str) -> None:
     assert "done" not in events, "被中止的流不该发 done，客户端会当成正常结束"
     errors = [json.loads(data) for event, data in frames if event == "error"]
     assert errors and errors[-1]["code"] == 22408
+
+
+# ------------------------------------------------- 心跳与数据流解耦（P0 回归）
+
+
+class SlowFirstTokenService:
+    """首字很慢的桩：TTFT 期间一个 token 都不产出。
+
+    真实场景是推理类模型 —— 20-40 秒才开始吐字，而心跳 TTL 只有 30 秒。
+    旧实现把心跳挂在数据流上，这段时间一次都不刷，消费端就会判"生产者已死"。
+    """
+
+    model = "stub-model"
+
+    def __init__(self, answer: str, ttft: float) -> None:
+        self.answer = answer
+        self.ttft = ttft
+
+    async def astream_chat(self, payload: object, history: object):
+        await asyncio.sleep(self.ttft)
+        for piece in self.answer:
+            yield TokenDelta(piece)
+        yield StreamFinished(model=self.model, prompt_tokens=1, completion_tokens=len(self.answer))
+
+
+def test_heartbeat_keeps_running_during_long_first_token(
+    test_redis_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """首字延迟超过心跳 TTL 时，消费端不能误判"生产者已死"。
+
+    这条用例锁住的是最贵的那个 bug：心跳挂在数据流上时，模型 30 秒不吐字，
+    beat 键过期 → 消费端 producer_alive=False → 给用户发 22408 并断开，
+    而生产者还在跑、还在烧 token。用户看到失败，账单继续走。
+    """
+    import app.services.stream_hub as hub
+
+    # 把时间尺度压小：TTL 1 秒、心跳 0.2 秒、TTFT 1.6 秒
+    monkeypatch.setattr(hub, "_BEAT_TTL_SECONDS", 1)
+    monkeypatch.setattr(hub, "_BEAT_INTERVAL_SECONDS", 0.2)
+    monkeypatch.setattr(hub, "_WATCHDOG_TICK_SECONDS", 0.1)
+
+    answer = "慢启动模型"
+    turn_id = 990003
+
+    async def scenario() -> tuple[list[str], list[dict]]:
+        redis = Redis.from_url(test_redis_url, decode_responses=True)
+        try:
+            buffer = StreamBuffer(redis, 600)
+            settings = Settings(_env_file=None, SSE_RESUME_GRACE_SECONDS=30)
+            conversations = RecordingConversations()
+            runner = _make_runner(
+                buffer,
+                SlowFirstTokenService(answer, ttft=1.6),
+                conversations,
+                turn_id,
+                settings,
+            )
+            task = asyncio.create_task(runner.run())
+
+            events: list[str] = []
+            stream = stream_frames(
+                buffer=buffer,
+                context=TurnContext(conversation_id=1, assistant_message_id=turn_id),
+                after=STREAM_START,
+                settings=settings,
+            )
+            async for frame in stream:
+                events.append(frame.event)
+                if frame.event == "done":
+                    break
+            await stream.aclose()
+
+            await asyncio.wait_for(task, timeout=10)
+            return events, conversations.completed
+        finally:
+            await _cleanup_sse_keys(redis, turn_id)
+            await redis.aclose()
+
+    events, completed = asyncio.run(scenario())
+
+    assert "error" not in events, f"心跳断了，消费端误判成生产者已死：{events}"
+    assert events[-2:] == ["meta", "done"]
+    assert len(completed) == 1
+    assert completed[0]["status"] is MessageStatus.COMPLETE
+    assert completed[0]["answer"] == answer

@@ -34,6 +34,14 @@
     - 只有 alive：生产者进程崩了，消费者会一直等一个永远不来的块
       （XREAD 每次超时就重来，连接挂着、用户对着转圈）。
 
+**心跳必须由独立定时任务驱动，不能挂在数据流上。**
+挂在数据流上的写法看起来更"顺手"（每吐一块顺手刷一下心跳），但模型
+首字延迟（TTFT）是可以到 20-40 秒的，推理类模型尤其如此：这段时间
+`async for` 里一次循环都不会执行 —— 心跳不刷，`beat` 的 TTL 一过，
+消费端就判成"生产者已死"，给用户发"生成已中断"并断开；而生产者其实
+还在跑，还在烧 token。结果是最坏的组合：用户看到失败，账单继续走。
+所以 `_watchdog` 是独立 `asyncio.Task`，按墙钟无条件刷新心跳。
+
 代价与取舍
 ----------
 断线不再立刻停止生成，**这是这个功能的本质代价**：不知道客户端会不会回来，
@@ -42,6 +50,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -51,6 +60,7 @@ from dataclasses import dataclass, field
 from redis.asyncio import Redis
 from sse_starlette import JSONServerSentEvent, ServerSentEvent
 
+from app.core import metrics
 from app.core.config import Settings
 from app.core.sse import (
     EVENT_DELTA,
@@ -87,13 +97,14 @@ _READ_COUNT = 200
 # 否则是 socket 先超时、而不是 Redis 先返回"没有新数据"。
 _READ_BLOCK_MS = 1_000
 
-# 生产者心跳 TTL / 刷新间隔。TTL 也是消费端判定"生产者已死"的等待上限。
+# 生产者心跳 TTL / 刷新间隔。TTL 是消费端判定"生产者已死"的等待上限，
+# 刷新由 watchdog 按墙钟驱动（详见模块 docstring），与是否吐出 token 无关。
 _BEAT_TTL_SECONDS = 30
 _BEAT_INTERVAL_SECONDS = 5.0
 
-# 检查"还有没有人在听"的间隔。每块都查就是每个 token 一次 Redis GET，
-# 高频流下这比 token 本身还贵，所以按墙钟节流。
-_ALIVE_CHECK_INTERVAL_SECONDS = 2.0
+# watchdog 的轮询间隔：同时决定"多久发现客户端全走了"的精度。
+# 每轮一次 Redis GET（EXISTS），2 秒一次对单条流是可忽略的开销。
+_WATCHDOG_TICK_SECONDS = 2.0
 
 # 消费端刷新自己心跳的间隔，要比 grace 小得多，否则正常的读延迟会被误判成断线
 _ALIVE_TOUCH_INTERVAL_SECONDS = 5.0
@@ -248,50 +259,108 @@ class TurnRunner:
 
         self._turn_id: int = context.assistant_message_id or 0
         self._parts: list[str] = []
-        self._last_beat = 0.0
-        self._last_alive_check = 0.0
         self._ttl_set = False
+        # 用量在收尾时回填：被中止的轮次也要记，否则"账单对不上账"
+        self.prompt_tokens: int | None = None
+        self.completion_tokens: int | None = None
+        self._generation: asyncio.Task | None = None
+        self._abandoned = False
+        self._started_at = 0.0
+        self._first_token_at: float | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        """本轮消耗的 token 合计。网关不给用量时为 0。"""
+        return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
 
     async def run(self) -> None:
-        """跑完一轮。**不向外抛异常** —— 这是独立任务，抛出去没人接。"""
-        try:
-            finished = await self._stream()
-            await self._complete(finished)
-        except _Abandoned:
-            # `_tick` 已经写好了 INTERRUPTED 和终止帧，这里只需要安静退出
-            logger.info("生成已中止 turn=%s", self._turn_id)
-        except asyncio.CancelledError:
-            # 停机 / 主动取消：保住已生成的部分，让用户回来能看到"说到哪儿了"
-            logger.info("生成被取消 turn=%s，已生成 %d 块", self._turn_id, len(self._parts))
-            await self._shielded(self._interrupt())
-            raise
-        except (LLMUpstreamError, ServiceError) as exc:
-            # 流已开始，状态码改不了了，只能用事件传递
-            logger.error(
-                "对话流中断 code=%s turn=%s message=%s",
-                exc.error_code.code,
-                self._turn_id,
-                exc.message,
-                exc_info=exc,
-            )
-            await self._fail(exc.error_code.code, exc.message)
-        except Exception:  # noqa: BLE001
-            # 兜底：未知异常也要给客户端一个终止帧，否则它会一直等
-            logger.exception("对话流异常 turn=%s", self._turn_id)
-            await self._fail(10500, "服务内部异常")
-        finally:
-            await self._shielded(self._buffer.finish(self._turn_id))
+        """跑完一轮。**不向外抛异常** —— 这是独立任务，抛出去没人接。
 
-    async def _stream(self) -> StreamFinished | None:
-        """把模型输出搬进缓冲，返回结束元信息（网关不发时为 None）。"""
+        生成与看门狗是两个任务：
+            生成（`_generate`）    消费模型输出、追加分片
+            看门狗（`_watchdog`）  按墙钟刷心跳、检查还有没有人在听
+
+        拆分的原因见模块 docstring：心跳不能依赖模型"是否在吐字"。
+        但**状态迁移只由这里一个人做** —— watchdog 只负责打标并取消生成，
+        写库与终止帧都回到这里，否则两边会抢着写，客户端可能先收到
+        "已中断"、再收到一块迟到的 delta。
+        """
+        self._started_at = time.monotonic()
+        generation = asyncio.create_task(self._generate(), name=f"chat-gen-{self._turn_id}")
+        self._generation = generation
+        watchdog = asyncio.create_task(self._watchdog(), name=f"chat-watch-{self._turn_id}")
+
+        outcome = "failed"
+        with metrics.track_inflight():
+            try:
+                finished = await generation
+                await self._complete(finished)
+                outcome = "complete"
+            except asyncio.CancelledError:
+                if self._abandoned:
+                    outcome = "abandoned"
+                    logger.info(
+                        "无人接收，提前停止生成 turn=%s 已生成 %d 块",
+                        self._turn_id,
+                        len(self._parts),
+                    )
+                    # 继续跑是纯烧钱：生成的每个字都没人看，
+                    # 而且这个用户下次进来也不会要这半截回答（库里留 INTERRUPTED）
+                    await self._interrupt()
+                    await self._append(
+                        EVENT_ERROR,
+                        StreamError(
+                            code=22408, message="长时间没有客户端接收，生成已中止"
+                        ).model_dump_json(),
+                    )
+                    metrics.record_chat_error(22408)
+                    return
+                # 停机 / 主动取消：保住已生成的部分，让用户回来能看到"说到哪儿了"
+                outcome = "cancelled"
+                logger.info("生成被取消 turn=%s，已生成 %d 块", self._turn_id, len(self._parts))
+                # 生成跑在独立 task 里，取消外层不会自动带走它：
+                # 不显式取消的话，它会在我们写下"结束标记"之后继续消费上游、
+                # 继续往缓冲追加 —— 既烧 token，又给续传的客户端一串幽灵帧
+                generation.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await generation
+                await self._shielded(self._interrupt())
+                raise
+            except (LLMUpstreamError, ServiceError) as exc:
+                # 流已开始，状态码改不了了，只能用事件传递
+                logger.error(
+                    "对话流中断 code=%s turn=%s message=%s",
+                    exc.error_code.code,
+                    self._turn_id,
+                    exc.message,
+                    exc_info=exc,
+                )
+                await self._fail(exc.error_code.code, exc.message)
+            except Exception:  # noqa: BLE001
+                # 兜底：未知异常也要给客户端一个终止帧，否则它会一直等
+                logger.exception("对话流异常 turn=%s", self._turn_id)
+                await self._fail(10500, "服务内部异常")
+            finally:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+                await self._shielded(self._buffer.finish(self._turn_id))
+                self._record(outcome)
+
+    async def _generate(self) -> StreamFinished | None:
+        """把模型输出搬进缓冲，返回结束元信息（网关不发时为 None）。
+
+        这里**没有**心跳：见 `_watchdog`。首字延迟再长也不影响心跳，
+        这正是把两者拆开的目的。
+        """
         # 幂等：路由为了保证消费者不会抢在生产者之前读，已经先立过一次，
         # 这里再立一次是为了让 TurnRunner 单独使用时也自洽
         await self._buffer.start(self._turn_id, self._grace)
-        self._last_beat = time.monotonic()
 
         async for item in self._service.astream_chat(self._payload, self._history):
-            await self._tick()
             if isinstance(item, TokenDelta):
+                if self._first_token_at is None:
+                    self._first_token_at = time.monotonic()
                 self._parts.append(item.text)
                 await self._append(
                     EVENT_DELTA, json.dumps({"delta": item.text}, ensure_ascii=False)
@@ -301,28 +370,42 @@ class TurnRunner:
                 return item
         return None
 
-    async def _tick(self) -> None:
-        """心跳与"还有没有人在听"的节流检查。"""
-        now = time.monotonic()
-        if now - self._last_beat >= _BEAT_INTERVAL_SECONDS:
-            self._last_beat = now
-            await self._buffer.beat(self._turn_id)
+    async def _watchdog(self) -> None:
+        """独立定时任务：刷新生产者心跳 + 检查还有没有人在听。
 
-        if now - self._last_alive_check < _ALIVE_CHECK_INTERVAL_SECONDS:
-            return
-        self._last_alive_check = now
-        if await self._buffer.any_consumer_alive(self._turn_id):
+        这是 P0 修复的核心。原实现把心跳放在数据流循环里（每收到一块刷一次），
+        当模型首字超过 `_BEAT_TTL_SECONDS`（推理模型 20-40 秒的 TTFT 很常见）时，
+        心跳过期，消费端在 stream_frames 里 `producer_alive` 判 False，
+        给用户发"生成已中断"并断开 —— 而这边还在跑、还在烧 token。
+
+        现在它按墙钟跑：不管模型在不在吐字，心跳都准时续上。
+        """
+        last_beat = 0.0
+        while True:
+            await asyncio.sleep(_WATCHDOG_TICK_SECONDS)
+            now = time.monotonic()
+            if now - last_beat >= _BEAT_INTERVAL_SECONDS:
+                last_beat = now
+                await self._buffer.beat(self._turn_id)
+
+            if await self._buffer.any_consumer_alive(self._turn_id):
+                continue
+            # 没人听了：打标并停掉生成，收尾交给 run()
+            self._abandoned = True
+            if self._generation is not None and not self._generation.done():
+                self._generation.cancel()
             return
 
-        # 没人听了：停掉。继续跑是纯烧钱 —— 生成的每个字都没人看，
-        # 而且这个用户下次进来时也不会要这半截回答（库里留 INTERRUPTED）。
-        logger.info("无人接收，提前停止生成 turn=%s 已生成 %d 块", self._turn_id, len(self._parts))
-        await self._interrupt()
-        await self._append(
-            EVENT_ERROR,
-            StreamError(code=22408, message="长时间没有客户端接收，生成已中止").model_dump_json(),
+    def _record(self, outcome: str) -> None:
+        """记一轮的指标。首字延迟单独记，它和总耗时是两个不同的优化目标。"""
+        first = None if self._first_token_at is None else self._first_token_at - self._started_at
+        metrics.record_turn(
+            outcome=outcome,
+            seconds=time.monotonic() - self._started_at,
+            first_token_seconds=first,
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
         )
-        raise _Abandoned()
 
     async def _append(self, event: str, data: str) -> None:
         await self._buffer.append(self._turn_id, event, data)
@@ -336,6 +419,8 @@ class TurnRunner:
         """正常收尾：**先写库再发 done**。"""
         answer = "".join(self._parts)
         if finished is not None:
+            self.prompt_tokens = finished.prompt_tokens
+            self.completion_tokens = finished.completion_tokens
             await self._conversations.complete_turn(
                 self._context,
                 answer=answer,
@@ -374,6 +459,7 @@ class TurnRunner:
             self._context, reason=message, answer="".join(self._parts)
         )
         await self._append(EVENT_ERROR, StreamError(code=code, message=message).model_dump_json())
+        metrics.record_chat_error(code)
 
     async def _shielded(self, action) -> None:
         """在不被取消打断的前提下跑完收尾写库。
@@ -389,10 +475,6 @@ class TurnRunner:
             pass
         except Exception:  # noqa: BLE001
             logger.exception("对话收尾失败 turn=%s", self._turn_id)
-
-
-class _Abandoned(Exception):
-    """内部信号：无人接收，`_stream` 主动退出。"""
 
 
 # --------------------------------------------------------------- 消费者
@@ -411,12 +493,17 @@ async def stream_frames(
     """
     turn_id = context.assistant_message_id or 0
 
-    yield JSONServerSentEvent(
-        data=StreamStart(
-            conversation_id=str(context.conversation_id), message_id=str(turn_id)
-        ).model_dump(),
-        event=EVENT_START,
-    )
+    # start 帧**只在从头重放时发**（`after` 还是 0-0，说明客户端手里没有任何
+    # 游标，也就没收到过这个身份）。带游标续读时不发：客户端能拿出 id，就说明
+    # 它至少收到过一帧，conversation_id / message_id 早已知道。
+    # 无条件重发会让每个客户端都必须自己幂等一次，而这个判断服务端做更省。
+    if after == STREAM_START:
+        yield JSONServerSentEvent(
+            data=StreamStart(
+                conversation_id=str(context.conversation_id), message_id=str(turn_id)
+            ).model_dump(),
+            event=EVENT_START,
+        )
 
     last = after
     last_touch = 0.0
