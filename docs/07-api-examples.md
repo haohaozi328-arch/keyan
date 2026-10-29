@@ -47,6 +47,7 @@ http://127.0.0.1:8000/api/v1
 |    | `POST /chat`                   | 一次性返回完整回答，**需登录**             |
 |    | `POST /chat/stream`            | SSE 逐块返回，**需登录**               |
 |    | `GET /chat/stream/{message_id}` | 断线续传：从 `Last-Event-ID` 之后接着发（见 3.3.1、3.3.2） |
+|    | `POST /chat/regenerate/{message_id}` | 重新生成一条回答（SSE，见 3.3.3）         |
 | 会话 | `GET /conversations`           | 我的会话列表（游标分页，最近活跃优先）           |
 |    | `GET /conversations/{id}`      | 会话详情                          |
 |    | `GET /conversations/{id}/messages` | 历史消息（按 seq 升序，可往前翻页）        |
@@ -387,7 +388,7 @@ data: [DONE]
 
 | event   | 带 `id:` | data | 说明 |
 | ------- | ---- | --- | --- |
-| `start` | ❌   | `{"conversation_id","message_id"}` | 首帧，**先拿到 ID 再说话**；续传和评价都要用 |
+| `start` | ❌   | `{"conversation_id","message_id"}` | 首帧，**先拿到 ID 再说话**；续传和评价都要用。只在从头重放时出现（见 3.3.1） |
 | `delta` | ✅   | `{"delta": "增量文本"}` | 可能出现很多次，**按顺序拼接** |
 | `meta`  | ✅   | `{"model","prompt_tokens","completion_tokens","conversation_id","message_id"}` | 结束前一次，供统计用量；token 数可能为 `null` |
 | `done`  | ✅   | `[DONE]`（纯文本，不是 JSON） | 正常结束 |
@@ -397,7 +398,7 @@ data: [DONE]
 
 三个容易踩的点：
 
-1. **流开始前**的错误（未登录 401、参数不合法 422、LLM 未配置 503、会话不存在 404）仍然是普通 JSON，HTTP 状态码是真的 —— 要先判 `res.ok`。所以鉴权与归属校验都放在流开始之前，前端能拿到准确的状态码。
+1. **流开始前**的错误（未登录 401、参数不合法 422、LLM 未配置 503、会话不存在 404、触发成本闸门 429）仍然是普通 JSON，HTTP 状态码是真的 —— 要先判 `res.ok`。所以鉴权、归属校验、限流都放在流开始之前，前端能拿到准确的状态码。
 2. **流开始后**的错误只能靠 `event: error` 帧传（响应头已发出，状态码改不了）。所以两种错误通道都要处理。
 3. **回答在 `done` 之前就落库了**。客户端收到 `done` 立刻刷新会话列表不会出现"刚聊完但列表里没有"。
 
@@ -419,8 +420,8 @@ Last-Event-ID: 1793194654769-0
 | --- | --- |
 | 生成还没结束 | 先补发断线期间产生的块，然后接着实时推 —— 用户看到的是"卡一下又继续"，不是重来 |
 | 生成已结束 | 一次把剩下的块补完，补 `meta` + `done` 后关闭 |
-| 不带 `Last-Event-ID` | 从第一块开始重放（刷新页面"接着看"用这条） |
-| `Last-Event-ID` 已经在末尾之后 | 只回 `start` + `done`，立刻结束，不会挂着等 |
+| 不带 `Last-Event-ID` | 从第一块开始重放（刷新页面"接着看"用这条），此时才有 `start` 帧 |
+| `Last-Event-ID` 已经在末尾之后 | 只回 `done`，立刻结束，不会挂着等 |
 | 缓冲过期（默认留 10 分钟） | `410 / 22410`，改调本文 3.4 拉消息全文 |
 | 消息不存在 / 不是自己的 | `404 / 10404`（两者同一个响应，不泄露存在性） |
 
@@ -466,9 +467,11 @@ async function reconnect() {
 
 `id:` 是服务端分配的 Redis Stream entry id，客户端**不要解析、不要自增、不要比较大小**，只保存"最后一个"并原样回传。传一个不存在的 id 不会报错、不会串位，只是读到空。
 
-**③ `start` 帧可能重复收到，处理要幂等**
+**③ `start` 帧只在从头重放时出现，但仍要写幂等**
 
-`start` 故意不带 `id:`。所以在"收到 `start`、还没收到第一块 `delta`"时断线，`lastEventId` 仍为空，重连会从头重放，`start` 再来一次。**不要因为又收到 `start` 就清空已渲染的文本**——用 `message_id` 判重：相同就只更新状态，不同才是新一轮。
+带 `Last-Event-ID` 续读时后端**不再重发** `start`：客户端能拿出游标，就说明它收到过帧，会话/消息 ID 早已知道。只有"不带游标"或"收到 `start` 之后、第一块 `delta` 之前就断了"这两种从头重放的场景，才会再看到 `start`。
+
+即便如此也别在 `start` 里做破坏性操作（比如清空已渲染文本）：用 `message_id` 判重，相同就继续渲染，不同才是新一轮。
 
 **④ 五条终止路径，三条是"别再续了"**
 
@@ -502,6 +505,29 @@ Redis Stream 不是消费队列，读完不删。两个标签页拿同一个 `me
 
 - 单轮缓冲最多 10000 片（`XADD MAXLEN`，防跑飞的护栏，不是容量规划）。真被截断时"从头重放"会缺开头几帧，正常按 id 续读不受影响。
 - Redis 重启或 key 被淘汰 → 续传直接 `410`，与"过期"同样处理。
+
+**⑨ 429 是"等一会儿"，不是"重试一下"**
+
+`/chat`、`/chat/stream`、`/chat/regenerate` 都有成本闸门（每用户每分钟轮次、同时在途生成数、每日 token 额度），超限返回 `429 / 22429`，`message` 会说明是哪一种。**不要自动重试** —— 重试只会继续撞同一个计数。按 `message` 提示用户（"太快了，稍等几秒" / "同时只能进行 2 条对话" / "今日额度已用完"）。
+
+顺带一个产品上的建议：前端应当在拿到 429 时**禁用发送按钮若干秒**，而不是让用户继续点 —— 服务端拦得住，但体验上一直在报错。
+
+### 3.3.3 重新生成一条回答
+
+`POST /chat/regenerate/{message_id}`，`message_id` 是**助手消息**。返回的帧格式、续传方式与 `/chat/stream` 完全一致（首帧 `start` 给新的 `message_id`，之后 `delta` / `meta` / `done`）。
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/v1/chat/regenerate/373820569285558273 \
+  -H "Authorization: Bearer <access_token>"
+```
+
+语义上有三点必须知道：
+
+1. **提问不会被重复写入。** 会话里仍然是"一个问题 + 两条回答"，不是"两个问题 + 两条回答"。所以消息列表会出现两个 `role=assistant` 相邻的情况。
+2. **旧回答保留**，新回答的 `parent_message_id` 指向它。前端据此把旧回答标成"已被重新生成"（比如折叠、置灰），而不是当成两轮对话渲染。消息列表接口已经返回这个字段。
+3. **后续上下文只用新回答。** 之后继续聊，服务端会自动把被替代的那条排除，模型不会看到"问一次答两次"。
+
+要点：这是一次**完整的重新推理**，token 成本与正常一轮相同，同样走成本闸门；被限流时返回 `429 / 22429`，不会在会话里留下空消息。
 
 ### 3.4 会话列表与历史
 
@@ -676,6 +702,7 @@ Redis Stream 不是消费队列，读完不删。两个标签页拿同一个 `me
 | 22502 | 502  | LLM 上游服务异常       | 提示稍后重试                  |
 | 22503 | 503  | LLM 未配置          | 禁用对话入口                  |
 | 22504 | 504  | LLM 上游超时         | 提示稍后重试                  |
+| 22429 | 429  | 触发对话成本闸门         | 按 `message` 提示（刷太快 / 并发太多 / 额度用完），别自动重试轰炸 |
 | 22408 | 408  | 长时间无客户端接收，生成中止   | 拉消息列表取已生成的部分；断线了就别让它空转 |
 | 22410 | 410  | 流式缓冲已过期         | 改调 `GET /conversations/{id}/messages` 拿全文 |
 
@@ -814,6 +841,11 @@ export interface MessageItem {
   content: string;
   status: "streaming" | "complete" | "interrupted" | "failed";
   model: string | null;
+  /**
+   * 非空 = 这条回答是重新生成的，值是被它替代的那条消息 ID。
+   * 前端应把旧回答标成"已被重新生成"，而不是当成两轮对话渲染。
+   */
+  parent_message_id: string | null;
   /** 当前登录用户的评价；null = 没评价过 */
   feedback: FeedbackRating | null;
   feedback_reason: string | null;
@@ -1169,7 +1201,28 @@ export const api = {
       signal,
     });
 
-    // 流开始前的错误（401 / 422 / 503）仍是普通 JSON
+    // 流开始前的错误（401 / 422 / 429 / 503）仍是普通 JSON
+    if (!res.ok) throw await toApiError(res);
+    if (!res.body) throw new ApiError(-1, "响应体为空", res.status);
+    yield* chatEvents(res.body);
+  },
+
+  /**
+   * 重新生成一条回答（见 3.3.3）。
+   * 与 chatStream 的区别只有 URL：帧格式、错误通道、续传方式完全一样。
+   * 新回答是一条**新消息**，旧回答保留并被标记 parent_message_id。
+   * 429 / 22429 = 触发成本闸门，别自动重试。
+   */
+  async *regenerateStream(
+    messageId: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    const current = auth.get();
+    const res = await fetch(`${BASE}/chat/regenerate/${messageId}`, {
+      method: "POST",
+      headers: current ? { Authorization: `Bearer ${current.access}` } : {},
+      signal,
+    });
     if (!res.ok) throw await toApiError(res);
     if (!res.body) throw new ApiError(-1, "响应体为空", res.status);
     yield* chatEvents(res.body);
@@ -1432,7 +1485,8 @@ function forceInlineVerify() {
 | ~~对话历史持久化~~ | ✅ 已做：会话列表 + 历史消息 + 服务端加载上下文，见 3.4 |
 | ~~对话评价~~ | ✅ 已做：赞 / 踩 / 取消写进 `messages.feedback`，见 3.5 |
 | ~~SSE 断线续传~~ | ✅ 已做：每帧带 `id:`，用 `GET /chat/stream/{message_id}` + `Last-Event-ID` 续读，见 3.3.1；前端落地清单见 3.3.2 |
+| ~~重新生成回答~~ | ✅ 已做：`POST /chat/regenerate/{message_id}`（SSE），旧回答保留并用 `parent_message_id` 标记，见 3.3.3 |
+| ~~成本闸门~~ | ✅ 已做：超限 `429 / 22429`，见 3.3.2 ⑨ |
 | 会话搜索     | 没有搜索接口，列表只能按最近活跃翻页                          |
-| 重新生成回答   | `messages.parent_message_id` 字段留好了，但还没有"重新生成"接口   |
 | 忘记密码     | 没有重置密码接口                                   |
 | 人机验证     | ✅ 已接入，只保护 `POST /auth/verification-code`（注册/登录页共用发码，够用）；其他写接口没挂 |

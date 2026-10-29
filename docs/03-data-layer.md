@@ -58,6 +58,23 @@ async def create_message(session: AsyncSession, **kwargs) -> Message:
 
 `idx_msg_feedback (feedback, feedback_at)` 是给"把所有差评捞出来做 badcase 集"准备的，别在没有这个索引的表上跑 `WHERE feedback=2`。
 
+会话列表的索引是**覆盖查询条件与排序**的：
+
+```sql
+-- 真实查询
+WHERE user_id = ? AND deleted_at IS NULL
+ORDER BY last_message_at DESC, id DESC
+
+-- 对应索引
+idx_conv_user_recent (user_id, deleted_at, last_message_at DESC, id DESC)
+```
+
+少了 `deleted_at`，软删除的行要先回表取出来再丢弃 —— 删得越多，翻一页扫的行越多，最后表现成"翻页越来越慢"；少了 `id`，同毫秒创建的会话要靠 filesort 兜底。
+
+⚠️ 换这个索引时踩过一个坑：`fk_conv_user` 依赖 `user_id` 上的索引，MySQL 会直接拒绝 `DROP INDEX`（错误 1553）。迁移里必须"先建新索引 → 删旧索引 → 改名"，让外键约束在任意时刻都能找到可用索引。
+
+`idx_msg_parent` 是给"重新生成"用的：加载上下文要问"这条回答有没有被替代"（相关 `EXISTS` 子查询），没有索引就是每轮对话扫一遍 `messages`。
+
 `tests/test_db_contract.py` 会连真实库比对 `information_schema`：表、列、物理类型、索引、约束名逐项核对。**它当场抓到过 6 处漂移**——三个 `deleted_at` 漏了 `DATETIME(3)`、两个累计 token 写成了 `INT` 而库里是 `BIGINT`、`refresh_token_hash` 模型写 `VARCHAR` 库里是 `CHAR`。这类不一致单测看不出来，只会在上线后炸。
 
 数据库没起时这些测试自动 skip，不会阻塞本地跑单测。

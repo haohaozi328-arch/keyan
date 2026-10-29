@@ -109,6 +109,9 @@ uvicorn app.main:app --reload --port 8000
 | http://127.0.0.1:8000/api/v1/chat/status | 对话功能状态（是否已配置密钥） |
 | POST http://127.0.0.1:8000/api/v1/chat | 对话，一次性返回 |
 | POST http://127.0.0.1:8000/api/v1/chat/stream | 对话，SSE 流式返回 |
+| GET http://127.0.0.1:8000/api/v1/chat/stream/{message_id} | 断线续传 |
+| POST http://127.0.0.1:8000/api/v1/chat/regenerate/{message_id} | 重新生成一条回答（SSE） |
+| http://127.0.0.1:8000/metrics | Prometheus 指标（根路径，不在 /api/v1 下） |
 
 > 端口注意：本机 **8010 被系统保留**，绑定会报 WinError 10013，用 8000 即可。
 > 若 8000 被旧进程占用（报 `[Errno 10048]`），先找到并停掉：
@@ -133,3 +136,29 @@ ruff format .                       # 真正格式化
 鉴权相关用例需要 MySQL + Redis：注册要真写库（唯一约束、事务边界、级联删除用假的测不出来），验证码要真 TTL 和真 `INCR`。跑在**独立的 Redis db 15** 上，用 `SCAN` + `DEL` 清理（`FLUSHDB` 属于 `@dangerous`，被 ACL 拒），MySQL 侧只删邮箱前缀为 `sr-test-` 的行，不碰开发数据。任一后端不可达时整组 skip。
 
 > 注意：如果清理 Redis 失败，测试会**直接退出**而不是继续跑。否则配额计数会跨轮次累积，表现为"单跑能过、连着跑就 429"，极难定位。
+
+## 打包与 CI
+
+### 应用镜像
+
+```bash
+docker build -t agent-chat .
+# 或者直接用编排里的应用服务（会连 compose 里的 mysql / redis）
+docker compose --profile app up -d --build
+```
+
+镜像里是**锁定的**依赖（`requirements.lock`）：同一份代码在任何时间构建出来的依赖集合都一样。CI 里的测试则装 `requirements.txt` 的范围，让上游的新版本先在那里暴露问题 —— 两者分工不同，别把 CI 装的东西当成生产装的东西。
+
+镜像本身的几个决定：多阶段构建（编译工具链不进运行镜像）、非 root（uid 10001）、`tini` 接管 PID 1（uvicorn 才能收到 SIGTERM 走优雅停机，等在途 SSE 把 `interrupted` 写回库）、`HEALTHCHECK` 只打 liveness（依赖抖动不该触发重启）。
+
+### CI（.github/workflows/ci.yml）
+
+| job | 内容 |
+| --- | --- |
+| `lint` | `ruff check` + `ruff format --check` |
+| `test` | 真 MySQL 8.4 + 真 Redis（带密码，否则相关用例整体 skip）+ `alembic upgrade head` + `alembic check` + 全量 `pytest` |
+| `image` | `docker build`，防止 Dockerfile 悄悄坏掉（漏 COPY、路径失效） |
+
+CI 里的 MySQL 账号是**手工收权的**，和 `deploy/mysql/initdb` 保持一致：`app` 只有 DML，DDL 归 `migrator`。用 root 跑测试会让"运行时账号不能有 DDL 权限"那条断言失真 —— 而它正是防注入的第二道墙。
+
+`alembic check` 是防漂移的关键一步：改了模型却忘了生成迁移，单元测试永远自洽（它们用的是模型），只有这一步能发现库里缺列。

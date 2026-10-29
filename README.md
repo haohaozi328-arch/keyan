@@ -2,9 +2,11 @@
 
 FastAPI + LangChain 的分层服务骨架。分层跟随 FastAPI 生态的惯例：路由薄、业务进 service、SQL 只落在仓储；读代码时沿着"请求从哪进来 → 业务在哪 → 数据从哪出去"这条线走，比按目录逐个看更快。
 
-对外链路四条：**邮箱注册登录**（`/api/v1/auth`）、**LLM 对话**（`/api/v1/chat`）、**会话与消息**（`/api/v1/conversations`、`/api/v1/messages`）、**健康检查**（`/api/v1/health`）。底层铺好了雪花 ID、MySQL + Alembic 迁移、Redis、统一响应外壳、业务错误码、全局异常处理。
+对外链路四条：**邮箱注册登录**（`/api/v1/auth`）、**LLM 对话**（`/api/v1/chat`）、**会话与消息**（`/api/v1/conversations`、`/api/v1/messages`）、**健康检查**（`/api/v1/health`）。底层铺好了雪花 ID、MySQL + Alembic 迁移、Redis、统一响应外壳、业务错误码、全局异常处理、结构化日志与 Prometheus 指标（`/metrics`）。
 
-对话是**有状态且必须登录**的：服务端建会话、落两条消息、按 `conversation_id` 加载上下文（请求体里没有 `history`，客户端无法指定喂给模型的上下文）；流式回答在 `done` 之前就提交；生成与连接解耦（生产者任务 + Redis Stream 分片缓冲），断线后拿 `Last-Event-ID` 调 `GET /chat/stream/{message_id}` 就能接着读，不重新生成、不重复计费，长时间没人回来才停（`interrupted`，保留已生成部分）。每条助手回复可以赞 / 踩 / 取消，写进 `messages.feedback`，消息列表直接回显。
+对话是**有状态且必须登录**的：服务端建会话、落两条消息、按 `conversation_id` 加载上下文（请求体里没有 `history`，客户端无法指定喂给模型的上下文）；流式回答在 `done` 之前就提交；生成与连接解耦（生产者任务 + Redis Stream 分片缓冲），断线后拿 `Last-Event-ID` 调 `GET /chat/stream/{message_id}` 就能接着读，不重新生成、不重复计费，长时间没人回来才停（`interrupted`，保留已生成部分）。每条助手回复可以赞 / 踩 / 取消，写进 `messages.feedback`，消息列表直接回显；可以**重新生成**某条回答（旧回答保留并用 `parent_message_id` 标记替代关系）。
+
+花 token 的三个入口都有**成本闸门**：每用户每分钟轮次、同时在途生成数、每日 token 预算，外加输出侧的 `LLM_MAX_TOKENS` 硬上限 —— 只校验 JWT 挡不住账单。
 
 鉴权是完整闭环：VAPTCHA 人机验证 → 邮箱验证码 → 注册 → JWT access + 落库 refresh → 刷新轮换 → 登出撤销，含三层发码限流与账号枚举防护。
 
@@ -13,7 +15,7 @@ FastAPI + LangChain 的分层服务骨架。分层跟随 FastAPI 生态的惯例
 ## 快速开始
 
 ```bash
-# 1. 依赖（conda 只声明解释器，包版本唯一来源是 requirements*.txt）
+# 1. 依赖（conda 只声明解释器，包版本唯一来源是 requirements*.txt / requirements.lock）
 conda env create -f environment.yml && conda activate fastapi-learn
 
 # 2. 配置：应用与 docker compose 共用这一个文件
@@ -29,13 +31,20 @@ alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
 
-打开 http://127.0.0.1:8000/docs 即可调试（右上角 Authorize 可填令牌）。
+打开 http://127.0.0.1:8000/docs 即可调试（右上角 Authorize 可填令牌），指标在 http://127.0.0.1:8000/metrics。
 
 验证：
 
 ```bash
 pytest                       # 全部用例
 ruff check . && ruff format --check .
+alembic check                # 模型与数据库有没有漂移
+```
+
+想验证"打包后能不能跑"（而不是本机能不能跑）：
+
+```bash
+docker compose --profile app up -d --build    # 应用也进容器，连 compose 里的 mysql / redis
 ```
 
 ---
@@ -75,8 +84,11 @@ sr/
 ├── docs/                    # 本目录文档
 ├── prompts/                 # 提示词正文（内容资产，不进代码包）
 ├── web/                     # 零构建联调页（VAPTCHA 单点 + 全链路）
-├── docker-compose.yml       # MySQL 8.4 LTS + Redis 7.4
-├── requirements.txt         # 运行时依赖
+├── docker-compose.yml       # MySQL 8.4 LTS + Redis 7.4（--profile app 时多一个应用容器）
+├── Dockerfile               # 应用镜像：多阶段构建、非 root、tini 接管 PID 1
+├── .github/workflows/ci.yml # lint + 真 MySQL/Redis 跑测试 + 镜像构建
+├── requirements.txt         # 运行时依赖（范围）
+├── requirements.lock        # 精确版本（生产镜像装它）
 ├── requirements-dev.txt     # 开发/测试依赖（-r requirements.txt）
 └── .env.example             # 唯一配置模板
 ```
@@ -89,7 +101,7 @@ sr/
 
 - **接口层不写业务**：`api/routes/` 只做协议转换，业务进 `services/`，SQL 进 `repositories/`。
 - **表结构只有一个来源**：`alembic/versions/`。容器启动不建表，`deploy/mysql/initdb/` 只放权限脚本。
-- **依赖版本只有一个来源**：`requirements*.txt`。`environment.yml` 用 `-r` 引用，不重复列包。
+- **依赖版本只有一个来源**：`requirements*.txt` 写范围，`requirements.lock` 写精确版本。`environment.yml` 用 `-r` 引用，不重复列包。
 - **配置只有一个来源**：根目录 `.env`。应用与 `docker compose` 读同一个文件，密码不写两遍。
 - **内容资产不进代码包**：提示词正文在 `prompts/`，位置由 `PROMPTS_DIR` 决定，容器可挂载覆盖，改文案不必重新发版。
 - **错误出口只有两条**：HTTP 状态码（真实状态，不是一律 200）+ 统一外壳里的 `code`。流式接口额外走 SSE `event: error`。
@@ -98,6 +110,6 @@ sr/
 
 ## 状态
 
-已完成：统一返回 / 异常处理 / 错误码 / 表结构 + Alembic / 仓储层 / 雪花 ID / 注册登录鉴权（含 VAPTCHA 人机验证）/ 有状态对话（强制登录 + 落库 + 服务端上下文）/ SSE 断线续传 / 会话列表与历史 / 消息评价 / 就绪探针查 DB+Redis。
+已完成：统一返回 / 异常处理 / 错误码 / 表结构 + Alembic / 仓储层 / 雪花 ID / 注册登录鉴权（含 VAPTCHA 人机验证）/ 有状态对话（强制登录 + 落库 + 服务端上下文）/ SSE 断线续传 / 会话列表与历史 / 消息评价 / 重新生成回答 / 对话成本闸门（频率 + 并发 + 日额度 + 输出上限）/ 按 token 预算裁剪上下文 / 结构化日志 + `/metrics` / 就绪探针查 DB+Redis / Docker 镜像 + GitHub Actions。
 
-未做：会话搜索、重新生成回答、忘记密码、RAG、评价数据回灌 —— 见 [06 下一步](docs/06-roadmap.md)。
+未做：会话搜索、忘记密码、RAG、评价数据回灌、分布式追踪（OTel）—— 见 [06 下一步](docs/06-roadmap.md)。

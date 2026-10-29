@@ -35,7 +35,9 @@ sr/
 │   │   ├── errors.py           # 错误码表 + AppError
 │   │   ├── response.py         # 统一响应外壳 ApiResponse[T]
 │   │   ├── context.py          # 请求级 ContextVar（trace_id）
-│   │   ├── middleware.py       # trace_id 中间件（纯 ASGI，不缓冲 SSE）
+│   │   ├── middleware.py       # trace_id 中间件 + 指标采集中间件（纯 ASGI，不缓冲 SSE）
+│   │   ├── logging.py          # 结构化日志：JSON / text 两种格式，自动带 trace_id
+│   │   ├── metrics.py          # Prometheus 指标定义（独立 Registry，标签用路由模板）
 │   │   ├── exception_handlers.py  # 四类异常的集中翻译
 │   │   ├── security.py         # 密码哈希（argon2id）+ 令牌签发/校验
 │   │   ├── snowflake.py        # 雪花 ID 生成器（时间有序、多实例不冲突）
@@ -62,9 +64,10 @@ sr/
 │   │   └── routes/             # 一个资源一个文件
 │   │       ├── auth.py         # 发码 / 注册 / 登录 / 刷新 / 登出 / 当前用户
 │   │       ├── health.py       # 存活探针 + 就绪探针
-│   │       ├── chat.py         # 一次性对话 + SSE 流式 + 断线续传 + 状态
+│   │       ├── chat.py         # 一次性对话 + SSE 流式 + 断线续传 + 重新生成 + 状态
 │   │       ├── conversations.py    # 会话列表 / 详情 / 历史 / 改名 / 软删
-│   │       └── messages.py     # 消息评价
+│   │       ├── messages.py     # 消息评价
+│   │       └── metrics.py      # Prometheus 抓取（根路径 /metrics，不套统一外壳）
 │   ├── schemas/                # 接口契约（Pydantic 模型）
 │   │   ├── auth.py             # 邮箱归一化 + 密码长度策略
 │   │   ├── health.py
@@ -77,8 +80,10 @@ sr/
 │   │   ├── vaptcha_service.py  # VAPTCHA 服务端验签（remote / local）
 │   │   ├── mail_service.py     # 异步 SMTP 发信
 │   │   ├── llm_service.py      # LangChain LCEL 链封装（invoke / astream_events）
-│   │   ├── conversation_service.py # 会话归属、上下文组装、落库收尾
-│   │   └── stream_hub.py       # SSE 分片缓冲 + 生产者任务 + 断线续传
+│   │   ├── conversation_service.py # 会话归属、上下文组装、落库收尾、重新生成
+│   │   ├── context_budget.py   # token 估算 + 按预算裁剪历史
+│   │   ├── chat_throttle.py    # 成本闸门：频率 / 在途并发 / 日 token 额度
+│   │   └── stream_hub.py       # SSE 分片缓冲 + 生产者任务 + 看门狗 + 断线续传
 │   └── utils/                  # 通用工具
 │       ├── ids.py              # 路径里的雪花 ID 解析（只收纯数字）
 │       ├── net.py              # IP ↔ VARBINARY(16)
@@ -98,7 +103,9 @@ sr/
 │   ├── test_models.py          # 纯 metadata 断言（物理类型 / 约束名）
 │   ├── test_db_contract.py     # 连真库比对 information_schema + 权限收权校验
 │   ├── test_conversations.py   # 会话列表 / 历史 / 归属 404
-│   ├── test_stream_resume.py   # 续传：id 帧 / 重放 / 续读 / 过期 / 无人接收
+│   ├── test_stream_resume.py   # 续传：id 帧 / 重放 / 续读 / 过期 / 无人接收 / 心跳独立性
+│   ├── test_context_budget.py  # token 估算 + 预算裁剪
+│   ├── test_chat_throttle.py   # 成本闸门：并发 / 频率 / 日额度 / 429 不落库
 │   └── test_mysql_driver.py    # PyMySQL 与 aiomysql 的转义兼容
 ├── alembic/                    # 数据库迁移（表结构的唯一真相源）
 │   ├── env.py                  # 复用 app 的配置与模型，DSN 不写进 ini
@@ -119,9 +126,12 @@ sr/
 ├── prompts/                    # 提示词正文（内容资产，不属于代码包）
 │   └── chat_system.md          # 正文 + 元数据（id / version / description）
 ├── web/                        # 零构建联调页（VAPTCHA 单点 + 全链路）
-├── docker-compose.yml          # MySQL 8.4 LTS + Redis 7.4（必须在根目录，见 02）
+├── docker-compose.yml          # MySQL 8.4 LTS + Redis 7.4（+ profile=app 的应用容器）
+├── Dockerfile                  # 应用镜像：多阶段、非 root、tini、HEALTHCHECK
+├── .github/workflows/ci.yml    # lint / test（真 MySQL+Redis）/ image
 ├── environment.yml             # conda 环境：只声明解释器，用 -r 引用 requirements
-├── requirements.txt            # 运行时依赖（唯一版本来源）
+├── requirements.txt            # 运行时依赖（范围）
+├── requirements.lock           # 精确版本（生产镜像装它）
 ├── requirements-dev.txt        # 开发/测试依赖（-r requirements.txt）
 ├── pyproject.toml              # 项目元信息 + pytest / ruff 配置
 ├── .env.example                # 唯一配置模板（应用与 compose 共用）

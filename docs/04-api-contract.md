@@ -57,6 +57,7 @@
 | `22502` | 502 | LLM 上游异常 |
 | `22503` | 503 | LLM 未配置 |
 | `22504` | 504 | LLM 上游超时 |
+| `22429` | 429 | 触发对话成本闸门：频率超限 / 在途流过多 / 当日 token 额度用尽（文案区分，客户端动作都是等待） |
 | `22408` | 408 | 流式生成期间长时间没有客户端接收，服务端主动中止（已生成部分存为 `interrupted`） |
 | `22410` | 410 | 流式分片缓冲已过期（TTL 到期 / 进程重启）。消息本身还在，客户端应改拉消息全文 |
 
@@ -83,10 +84,13 @@
 
 | 方法 | 路径 | 语义 | 失败状态码 |
 | --- | --- | --- | --- |
-| POST | `/chat` | 一次性返回，适合短回答与服务端调用 | 401 未登录、404 会话不存在/不属于本人、503 未配置、502 上游异常、422 校验失败 |
-| POST | `/chat/stream` | SSE 流式返回（`text/event-stream`） | 流开始前：401 / 404 / 503 / 422；流开始后：error 事件 |
+| POST | `/chat` | 一次性返回，适合短回答与服务端调用 | 401 未登录、404 会话不存在/不属于本人、429 触发闸门、503 未配置、502 上游异常、422 校验失败 |
+| POST | `/chat/stream` | SSE 流式返回（`text/event-stream`） | 流开始前：401 / 404 / 429 / 503 / 422；流开始后：error 事件 |
 | GET | `/chat/stream/{message_id}` | 断线续传：从 `Last-Event-ID` 之后接着读 | 401 未登录、404 消息不存在/不属于本人、410 缓冲已过期、400 续传位置格式不合法 |
+| POST | `/chat/regenerate/{message_id}` | 重新生成一条回答（SSE，帧格式与 `/chat/stream` 相同） | 401 / 404 / 429 / 503；流开始后：error 事件 |
 | GET | `/chat/status` | 配置状态（运维自检，不打真网络） | — |
+
+**重新生成**不重复写用户提问：新回答作为一条新消息追加在末尾，旧回答保留（可以对比，也保住了它的评价与 badcase 记录）。新消息的 `parent_message_id` 指向被替代的那条，之后的上下文只会使用新回答 —— 否则模型会看到"问一次、答两次"，越聊越偏。续传同样用 `GET /chat/stream/{新 message_id}`。
 
 请求体只有 `message`（必填）和 `conversation_id`（可选）。**没有 `history`**：上下文由服务端按 `conversation_id` 从数据库加载，客户端传了也不会生效 —— 让浏览器决定喂给模型什么上下文，等于把提示注入的入口开在客户端。
 
@@ -100,13 +104,47 @@
 | `SSE_RESUME_GRACE_SECONDS` | 30 | **所有**客户端断开超过这么久就停止生成（已生成部分存 `interrupted`），避免无上限烧 token |
 | `SSE_RESUME_TTL_SECONDS` | 600 | 生成结束后分片缓冲保留多久，过期后续传返回 `410 / 22410` |
 
+**生产者心跳不由数据流驱动。** 心跳跑在独立的 watchdog 任务里，按墙钟每 5 秒刷新一次（TTL 30 秒）；如果挂在"每收到一个 token 刷一次"上，模型首字延迟 20-40 秒的推理类模型就会被消费端误判成"生产者已死" —— 用户看到"生成已中断"，而服务端还在烧 token。
+
+### 成本闸门
+
+对话接口只校验 JWT 是不够的：一个账号可以无限并发、无限长输出。三道闸都在**写库之前**拦：
+
+| 闸门 | 配置 | 默认 | 拦下时 |
+| --- | --- | --- | --- |
+| 每用户每分钟轮次 | `CHAT_RATE_LIMIT_PER_MINUTE` | 10 | `429 / 22429` |
+| 每用户同时在途生成 | `CHAT_MAX_CONCURRENT_STREAMS` | 2 | `429 / 22429` |
+| 每用户每日 token | `CHAT_DAILY_TOKEN_BUDGET` | 200000（0=不限） | `429 / 22429` |
+
+输出侧还有一道硬闸：`LLM_MAX_TOKENS`（默认 2048）。不设上限等于把账单控制权交给模型 —— 一次跑飞的长回答能吃掉几万 token，而用户通常看不到一半就离开了。
+
+上下文的裁剪按 **token 预算**（`CHAT_CONTEXT_MAX_TOKENS`，默认 3000），条数（`CHAT_CONTEXT_MESSAGES`，默认 20）只作兜底：单条消息上限 8000 字符，20 条最坏就是 4 万 token。
+
+## 指标（/metrics）
+
+`GET /metrics` 返回 Prometheus 文本格式，**不套**统一响应外壳（抓取端只认标准格式），也**不在** `/api/v1` 下（抓取路径是运维侧的约定值）。
+
+| 指标 | 类型 | 用途 |
+| --- | --- | --- |
+| `chat_streams_inflight` | Gauge | 当前在途生成数。持续偏高说明上游慢或有人在刷 |
+| `chat_turns_total{outcome}` | Counter | 终态分布：complete / interrupted / failed / abandoned / cancelled |
+| `chat_first_token_seconds` | Histogram | 首字延迟。用户抱怨"卡"多半是它，而不是总耗时 |
+| `chat_turn_duration_seconds` | Histogram | 单轮总耗时 |
+| `chat_tokens_total{direction}` | Counter | 累计 token 用量（网关不返回用量时不记） |
+| `chat_errors_total{code}` | Counter | 按业务错误码统计 |
+| `chat_rejected_total{reason}` | Counter | 被闸门拦下：rate / concurrency / quota |
+| `http_requests_total{method,path,status}` | Counter | 标签是**路由模板**，不是原始路径（否则每个会话 ID 一条时间序列） |
+| `http_request_duration_seconds` | Histogram | SSE 记录的是整条流的生命周期，不是首字节 |
+
+默认不鉴权：它只暴露聚合数字，行业标准做法是靠网络隔离（只监听内网、反向代理限制来源）。要更严格就 `METRICS_ENABLED=false`，改由 sidecar 抓 `localhost:8000/metrics`。
+
 ## SSE 帧格式
 
 每一帧的 `id:` 是 Redis Stream 的 entry id，也是续传锚点：客户端存最后一个，重连时作为 `Last-Event-ID` 回传。
 
 | event | 带 `id:` | data | 说明 |
 | --- | --- | --- | --- |
-| `start` | ❌ | `{"conversation_id":"...","message_id":"..."}` | 首帧，先给身份再说话；续传与评价都要用。不带 id 是故意的：第一块之前断开时 `Last-Event-ID` 为空，正好从头重放 |
+| `start` | ❌ | `{"conversation_id":"...","message_id":"..."}` | 首帧，先给身份再说话；续传与评价都要用。**只在从头重放时发送**（`Last-Event-ID` 为 `0-0` 或未带），带游标续读不重发。不带 id 是故意的：第一块之前断开时 `Last-Event-ID` 为空，正好从头重放 |
 | `delta` | ✅ | `{"delta":"增量文本"}` | 模型增量输出，客户端顺序拼接即得完整回答 |
 | `meta` | ✅ | `{"model":"...","prompt_tokens":157,"completion_tokens":4,"conversation_id":"...","message_id":"..."}` | 结束前给出实际模型、用量与会话/消息 ID（评价接口要用） |
 | `done` | ✅ | `[DONE]` | 结束哨兵，收到后停止读取 |
