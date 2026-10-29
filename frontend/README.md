@@ -72,7 +72,7 @@ npm start
 | `src/components/ChatSidebar.vue` | 历史会话、账户入口 |
 | `src/components/ChatComposer.vue` | 输入、提示模式、停止和续传 |
 | `src/components/ChatMessage.vue` | 消息展示、复制、评价 |
-| `src/components/AuthDialog.vue` | 登录注册表单、VAPTCHA |
+| `src/components/AuthPanel.vue` | 登录注册页面（主区域一级视图，不是弹窗）、VAPTCHA 内嵌验证 |
 | `src/components/MarkdownContent.vue` | 安全 Markdown 渲染边界 |
 | `src/composables/useChat.js` | 响应式状态、聊天及账户流程 |
 | `api-client.mjs` | HTTP、令牌刷新、SSE 解析 |

@@ -1458,24 +1458,50 @@ certutil -addstore -user Root cert.cer   # 删除：certutil -delstore -user Roo
 
 改成 `strict-origin-when-cross-origin`（浏览器默认值，跨源只带 origin、不带 path 与 query）即可。**`vite dev` 没设这个头，只有 `node server.cjs` 会踩**，所以症状是"开发环境人机验证正常、build 之后必失败"，很容易误判成平台侧白名单问题。
 
-**Edge 兼容：强制内嵌验证，不弹独立窗口**
+**登录/注册不要做成 `<dialog>` 弹窗**
 
-SDK 在 PC 上默认走 `window.open` 弹一个验证窗口，由父页面用 `postMessage` 把初始化数据（boot）递进去。Edge 里这条通道不成立：窗口能打开、标题也渲染出来，但一直停在「验证准备中…」，既不画图也不报错——本质是那个窗口没收到 boot（单独打开 `verify.html` 也是同一现象，它的 `postMessage` 找不到 opener）。
+真正让人「看不到验证码」的是 top layer，不是浏览器。`AuthDialog` 用 `<dialog>.showModal()` 打开，弹窗会进入浏览器的 top layer —— 层级高于**任何** `z-index`。而 VAPTCHA 的验证面片是 SDK 动态创建的 `#vaptcha_iframe_overlay`，挂在 `<body>` 下、`position: fixed; z-index: 999999`，于是被弹窗整块盖住。
 
-两个联调页因此都加了一个十几行的兼容层：**把 SDK 的内嵌分支固定为开启**，验证面片直接展开在当前页面里（SDK 自己挂的全屏遮罩层 `#vaptcha_iframe_overlay`，不占布局），Chrome / Edge 表现一致，也不再依赖 popup 里的 `window.opener`。
+症状很有欺骗性：点「获取验证码」后按钮变成「正在发送…」，`captcha.validate()` 正常挂起等用户操作，`#vaptcha_iframe` 也已经建好（420×450），但屏幕上什么都没有。一条命令就能确认：
 
 ```js
-function forceInlineVerify() {
-  const proto = window.VaptchaCore && window.VaptchaCore.prototype;
-  if (!proto || typeof proto.shouldUseIframe !== "function") return false; // SDK 改了就跳过
-  proto.shouldUseIframe = function () { return true; };
-  return true;
+// 面板区域中心命中的是谁？命中的是弹窗里的输入框，就说明浮层被盖住了
+const f = document.getElementById('vaptcha_iframe'), r = f.getBoundingClientRect();
+document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2).id;  // → "password"
+```
+
+**这跟浏览器无关**：Chrome 156 与 Edge 156 实测表现完全一致，所以「Edge 没有验证码、Chrome 正常」通常是没在 Chrome 里走过注册流程造成的错觉。
+
+修法不是加 `z-index`（对 top layer 无效），也不是把浮层提成 popover（视觉能出来，但 modal 会让它不可交互），而是**别用弹窗**：登录/注册改成主区域里的一级页面（`frontend/src/components/AuthPanel.vue`，由 `state.dialog === 'auth'` 切换），浮层回到普通层叠上下文，`z-index: 999999` 足够盖住页面内容，点击和拖拽都能正常到达 iframe。
+
+**Edge 兼容：强制内嵌验证，不弹独立窗口**
+
+SDK 在 PC 上默认走 `window.open` 弹一个独立验证窗口，由父页面用 `postMessage` 把初始化数据（boot）递进去。Edge 里这条通道不成立：窗口能打开、标题也渲染出来（`VAPTCHA - 智能人机验证 - 个人`），但内容一直白屏、停在「验证准备中…」，既不画图也不报错 —— 本质是那个窗口没收到 boot（单独打开 `verify.html` 也是同一现象，它的 `postMessage` 找不到 opener）。
+
+真正决定走哪条分支的是 `core.js` 里的这一行：
+
+```js
+shouldUseIframe() || !navigator.userActivation.isActive ? openAsIframe() : openPopup()
+```
+
+也就是说**真人点击时 `userActivation.isActive` 为 true，只要 `shouldUseIframe()` 返回 false 就一定会弹窗**。这条也解释了调试时的错觉：用无头浏览器或脚本 `click()` 触发（没有用户激活）永远走内嵌分支，看着「没问题」；换真人手点就弹出白窗口。
+
+正式前端（`frontend/src/components/AuthPanel.vue`）把内嵌分支固定为开启，验证面片直接展开在当前页面（SDK 自己挂的全屏遮罩 `#vaptcha_iframe_overlay`，不占布局）：
+
+```js
+function forceInlineVerify(instance) {
+  const proto = window.VaptchaCore?.prototype;
+  if (proto && typeof proto.shouldUseIframe === 'function' && !proto.__inlineForced) {
+    proto.shouldUseIframe = () => true;
+    proto.__inlineForced = true;
+  }
+  try { if (instance?.shouldUseIframe) instance.shouldUseIframe = () => true; } catch { /* 只读 */ }
 }
 ```
 
-调用点：初始化之后、每次 `validate()` 之前各调一次（`core.js` 是懒加载的，早于初始化调用会拿不到 `VaptchaCore`）。
+调用点在 `await window.vaptcha({...})` 之后、`await captcha.validate()` 之前 —— `core.js` 是懒加载的，早于初始化调用会拿不到 `VaptchaCore`，patch 会静默失效。
 
-> 这是调试页里的兜底，不是官方 API。真实前端如果也用内嵌形态，优先在控制台把验证单元设成内嵌，或直接让 SDK 走默认弹窗——**只有确认弹窗分支在你的目标浏览器里可用时才用默认**。
+> 这不是官方 API，SDK 升级后要复查（`__inlineForced` 标记就是为了排查时能确认补丁是否生效）。能改平台配置的话，优先在 VAPTCHA 控制台把验证单元设成内嵌形态。
 
 页面报错时先看它自己打的日志：
 
@@ -1483,7 +1509,8 @@ function forceInlineVerify() {
 | --- | --- |
 | `当前网站未授权` + 页面是 http | 换 HTTPS，见上 |
 | `当前域名未授权`，已是 HTTPS | 白名单没放行该 hostname（`127.0.0.1` / `localhost` 要各加一条） |
-| 验证窗口停在「验证准备中…」 | 那个窗口没拿到父页面的 boot（Edge 走弹窗就是这条），改用内嵌，见上 |
+| 弹出一个空白窗口、一直「验证准备中…」 | 走了 `window.open` 分支且没拿到 boot（Edge 就是这条）；`forceInlineVerify()` 会强制内嵌 |
+| 面板完全不出现，按钮却卡在「正在发送…」 | 内嵌浮层被遮挡：检查登录/注册是不是又做成了 `<dialog>`（top layer），见上 |
 | `fetch 抛错` | 后端没起、端口不对，或 CORS 没放行页面来源 |
 | `HTTP 400 / code 11400` | 票据缺失或验签没过（看 message 区分） |
 | `HTTP 504 / code 21504` | 验签上游不可达，fail-closed |
