@@ -1,0 +1,27 @@
+{
+  "name": "qixue-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local chat frontend for the keyan FastAPI backend",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "start": "node start.cjs",
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test": "node --test tests/api-client.test.mjs && vitest run",
+    "check": "node --check api-client.mjs && node --check markdown.mjs && node --check server.cjs && node --check start.cjs && node --check src/composables/useChat.js"
+  },
+  "dependencies": {
+    "vue": "^3.5.44"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "@vue/test-utils": "2.4.6",
+    "jsdom": "26.1.0",
+    "vite": "^6.4.1",
+    "vitest": "4.1.12"
+  }
+}
