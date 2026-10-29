@@ -37,6 +37,8 @@ uvicorn app.main:app --reload --port 8000
 
 仓库包含基于 **Vue 3 + Vite** 的[启学聊天前端](frontend/README.md)，支持登录注册、流式聊天与续传、历史会话和评价。在 `frontend` 目录先执行 `npm ci --ignore-scripts --no-audit --no-fund`，开发运行 `npm run dev`；正式运行 `npm start` 或双击 `start.cmd`，访问 http://127.0.0.1:4318 。Node.js 建议使用 24 LTS。验证码 HTTPS 配置、组件分工和测试方法见前端说明。
 
+要让同一局域网的其它设备访问，前后端都要监听 `0.0.0.0`：后端 `uvicorn app.main:app --host 0.0.0.0 --port 8000`，前端加 `FRONTEND_HOST=0.0.0.0`；证书 SAN 需含本机局域网 IP，且每台设备都要信任该证书，否则人机验证会白屏。具体见[前端说明](frontend/README.md#局域网访问)。
+
 验证：
 
 ```bash

@@ -50,6 +50,42 @@ npm start
 
 此时访问 `https://127.0.0.1:4318`。证书需自行准备并受信任，VAPTCHA 控制台需允许当前域名。
 
+## 局域网访问
+
+同一 WiFi 下的其它设备（手机、同事的电脑）要打开页面时，前端和后端都要监听 `0.0.0.0`：
+
+```powershell
+$env:FRONTEND_HOST = '0.0.0.0'        # 不设则只监听 127.0.0.1
+$env:TLS_CERT = '..\.tmp-tls\cert.pem'
+$env:TLS_KEY  = '..\.tmp-tls\key.pem'
+npm start
+```
+
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+启动日志会列出全部可访问地址，取 `192.168.x.x` 那条。`BACKEND_URL` 不用改：浏览器走同源代理，真正的后端地址由 Node 进程在本机解析。
+
+三条前提，缺一条就会失败：
+
+1. **Host 白名单**：`server.cjs` 只接受回环与私有网段（`10.x`、`192.168.x`、`172.16-31.x`）。用域名访问时，把域名加进 `FRONTEND_ALLOWED_HOSTS`（逗号分隔）。
+2. **证书 SAN 要含局域网 IP**：证书和 IP 不匹配时浏览器会拦，页面 `isSecureContext` 变成 `false`，人机验证直接白屏。`.tmp-tls/cert.pem` 已签入 `192.168.1.105`，换网段要重签，见下。
+3. **每台访问设备都要信任这张证书**：把 `.tmp-tls/cert.cer` 装到设备上。不装的设备只能登录已有账号（登录不需要验证码），注册会卡在人机验证。
+
+重签证书（把 IP 换成本机实际地址）：
+
+```bash
+cd .tmp-tls
+openssl req -x509 -newkey rsa:2048 -sha256 -days 397 -nodes -keyout key.pem -out cert.pem \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:192.168.1.105" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign"
+openssl x509 -in cert.pem -outform DER -out cert.cer
+certutil -addstore -user Root cert.cer
+```
+
 ## 功能与接口
 
 - 登录、邮箱注册、单次并发令牌刷新和退出。

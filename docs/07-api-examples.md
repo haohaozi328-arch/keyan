@@ -1445,6 +1445,10 @@ certutil -addstore -user Root cert.cer   # 删除：certutil -delstore -user Roo
 
 导入后**关掉整个浏览器再打开**（同一个标签页刷新可能还沿用旧的证书判定），页面顶部的「连接配置」应该显示 `安全上下文正常 / isSecureContext=是 / crypto.subtle 可用`。这条诊断是页面自带的，绿了再去点人机验证。
 
+**局域网访问时，证书 SAN 必须含本机 IP**
+
+默认证书只签了 `localhost` 和 `127.0.0.1`。换成 `https://192.168.x.x:4318` 打开时证书对不上，浏览器直接拦页面，`isSecureContext` 变 `false`，验证窗口白屏——症状和「没导入证书」一模一样，很容易误判成人机验证服务端的问题。重签与分发方式见 `frontend/README.md` 的「局域网访问」。
+
 **Vue 前端用 `server.cjs` 时，别把 Referrer-Policy 设成 `no-referrer`**
 
 `frontend/server.cjs` 起初给所有响应设了 `Referrer-Policy: no-referrer`，结果 VAPTCHA 的 config 接口（`https://v4c.vaptcha.com/api/config?v=1&d=...`）收不到 `Referer`，上游回 `code 9`，SDK 抛「当前网站未授权」，注册和发码一起废掉。

@@ -1,12 +1,33 @@
 const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { pipeline } = require('node:stream');
+
+// Host 白名单：回环 + 私有网段，供局域网内其它设备访问；域名可用 FRONTEND_ALLOWED_HOSTS 追加。
+// 只放私有网段，不放开公网地址——这个进程是给开发和同网段联调用的。
+const LOOPBACK = /^(localhost|::1|127(?:\.\d{1,3}){3})$/;
+const PRIVATE_V4 = /^(10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})$/;
+function hostAllowed(hostHeader) {
+  const host = String(hostHeader || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) return false;
+  if (LOOPBACK.test(host) || PRIVATE_V4.test(host)) return true;
+  return String(process.env.FRONTEND_ALLOWED_HOSTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean).includes(host);
+}
 
 function envFile(filename) {
   try { return Object.fromEntries(fs.readFileSync(filename, 'utf8').split(/\r?\n/).filter(l => /^\s*[A-Z_]+\s*=/.test(l)).map(l => { const i = l.indexOf('='); return [l.slice(0, i).trim(), l.slice(i + 1).trim().replace(/^(['"])(.*)\1$/, '$2')]; })); }
   catch (e) { if (e.code !== 'ENOENT') throw e; return {}; }
+}
+function listenAddresses(host, port, scheme) {
+  const urls = [`${scheme}://127.0.0.1:${port}`];
+  if (host === '0.0.0.0' || host === '::') {
+    for (const list of Object.values(os.networkInterfaces())) for (const ni of list || []) {
+      if (ni.family === 'IPv4' && !ni.internal) urls.push(`${scheme}://${ni.address}:${port}`);
+    }
+  }
+  return urls;
 }
 function createServer(options = {}) {
   const dist = options.dist || path.join(__dirname, 'dist');
@@ -24,7 +45,7 @@ function createServer(options = {}) {
     // strict-origin-when-cross-origin 是浏览器默认值：跨源只带 origin，不带 path 与 query。
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://*.vaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.vaptcha.com; connect-src 'self' https://*.vaptcha.com; frame-src https://*.vaptcha.com; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
-    if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(req.headers.host || '') || (req.headers.origin && req.headers.origin !== origin)) return send(res, 403, { code: 10403, message: '请从本机页面访问。', data: null });
+    if (!hostAllowed(req.headers.host) || (req.headers.origin && req.headers.origin !== origin)) return send(res, 403, { code: 10403, message: '请从本机或同一局域网的页面访问。', data: null });
     if (req.url.startsWith('/api/v1/') && ['GET', 'POST', 'PATCH', 'DELETE'].includes(req.method)) {
       if (Number(req.headers['content-length']) > 120000) return send(res, 413, { code: 10413, message: '请求过大，请缩短内容。', data: null });
       const headers = { accept: req.headers.accept || 'application/json', 'accept-encoding': 'identity' };
@@ -53,9 +74,12 @@ function createServer(options = {}) {
   };
   return tls ? https.createServer(tls, handler) : http.createServer(handler);
 }
-module.exports = { createServer };
+module.exports = { createServer, listenAddresses };
 if (require.main === module) {
   const tls = process.env.TLS_CERT && process.env.TLS_KEY ? { cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY) } : undefined;
   const port = Number(process.env.FRONTEND_PORT || 4318);
-  createServer({ tls }).listen(port, '127.0.0.1', () => console.log(`Qixue frontend: ${tls ? 'https' : 'http'}://127.0.0.1:${port}`)).on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'Port in use. Set FRONTEND_PORT to another port.' : 'Cannot start frontend server.'); process.exitCode = 1; });
+  const host = process.env.FRONTEND_HOST || '127.0.0.1';
+  createServer({ tls }).listen(port, host, () => {
+    console.log(listenAddresses(host, port, tls ? 'https' : 'http').map((u, i) => (i ? ' '.repeat(17) : 'Qixue frontend: ') + u).join('\n'));
+  }).on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'Port in use. Set FRONTEND_PORT to another port.' : 'Cannot start frontend server.'); process.exitCode = 1; });
 }
