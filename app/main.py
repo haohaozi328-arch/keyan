@@ -12,9 +12,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router
+from app.api.routes.metrics import router as metrics_router
 from app.core.config import Settings, settings
 from app.core.exception_handlers import register_exception_handlers
-from app.core.middleware import TRACE_ID_HEADER, RequestContextMiddleware
+from app.core.logging import setup_logging
+from app.core.middleware import TRACE_ID_HEADER, MetricsMiddleware, RequestContextMiddleware
 from app.db import close_redis, dispose_engine
 from app.prompts import get_prompt_registry
 from app.services.stream_hub import TurnRegistry
@@ -81,6 +83,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """应用工厂：返回配置完毕的实例，便于测试时按需重建。"""
+    # 必须在任何 logger 输出之前装配：默认的 root logger 是 WARNING 级别，
+    # 会让项目里所有 logger.info（提示词版本、限流命中、生成中止）静默消失
+    setup_logging(settings)
+
     application = FastAPI(
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
@@ -102,6 +108,8 @@ def create_app() -> FastAPI:
         expose_headers=[TRACE_ID_HEADER],
     )
 
+    # 指标加在 trace_id 之内、CORS 之外：被 CORS 拒绝的请求也要计入
+    application.add_middleware(MetricsMiddleware)
     # 后加的在外层：trace_id 要在 CORS 之前拿到，
     # 这样连被 CORS 拒绝的响应也带 X-Request-ID
     application.add_middleware(RequestContextMiddleware)
@@ -109,6 +117,9 @@ def create_app() -> FastAPI:
     register_exception_handlers(application)
 
     application.include_router(api_router, prefix=settings.API_PREFIX)
+    if settings.METRICS_ENABLED:
+        # 根路径而不是 /api/v1：抓取路径是运维侧的约定值
+        application.include_router(metrics_router)
     return application
 
 

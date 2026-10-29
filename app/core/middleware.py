@@ -13,12 +13,14 @@ trace_id 的取值优先级：
 """
 
 import logging
+import time
 from uuid import uuid4
 
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.context import reset_trace_id, set_trace_id
+from app.core.metrics import record_http
 
 logger = logging.getLogger(__name__)
 
@@ -48,3 +50,49 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send_with_trace_id)
         finally:
             reset_trace_id(token)
+
+
+class MetricsMiddleware:
+    """HTTP 指标采集。同样是纯 ASGI —— 理由与 trace_id 中间件一致。
+
+    两个细节：
+
+    1. **标签用路由模板，不用原始路径。** `/api/v1/conversations/373814368841`
+       这样的路径每个会话一条时间序列，几天就能把 Prometheus 撑爆。
+       Starlette 在路由匹配后把 `route` 写进 scope，这里直接取它的 path 模板；
+       没匹配上（404）统一记成 `unmatched`。
+    2. **SSE 的耗时就该很长。** 它记的是整条流的生命周期，不是首字节；
+       首字延迟另有 `chat_first_token_seconds`，两者混在一起看会误判。
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.perf_counter()
+        # 默认 500：万一在响响应之前就抛了，记 500 比记 200 更接近事实
+        status = 500
+
+        async def capture(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        finally:
+            route = scope.get("route")
+            path = getattr(route, "path", None) or "unmatched"
+            # 抓取本身不计入，否则 Prometheus 每抓一次就污染一次请求指标
+            if path != "/metrics":
+                record_http(
+                    method=scope["method"],
+                    path=path,
+                    status=status,
+                    seconds=time.perf_counter() - started,
+                )

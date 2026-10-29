@@ -67,6 +67,10 @@ class ErrorCode(Enum):
     LLM_UPSTREAM_ERROR = ErrorSpec(22502, 502, "LLM 上游服务异常")
     LLM_NOT_CONFIGURED = ErrorSpec(22503, 503, "LLM 未配置")
     LLM_TIMEOUT = ErrorSpec(22504, 504, "LLM 上游响应超时")
+    # 成本闸门：请求太频 / 在途流太多 / 当日 token 预算用尽。
+    # 三者共用 429：客户端动作完全一样（等一会儿再来），
+    # 而区分成 403 或 402 只会让前端为"同一个处理"写三套分支。
+    CHAT_RATE_LIMITED = ErrorSpec(22429, 429, "对话请求过于频繁，请稍后再试")
     # 流式生成期间长时间没有任何客户端接收，服务端主动停掉（省 token）
     CHAT_STREAM_ABANDONED = ErrorSpec(22408, 408, "长时间没有客户端接收，生成已中止")
     # 分片缓冲已过期（TTL 到了 / 进程重启）：续传失败，客户端应改拉消息全文

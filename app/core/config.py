@@ -5,6 +5,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote_plus
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +28,20 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "learn-fastapi"
     VERSION: str = "0.1.0"
     DEBUG: bool = False
+
+    # ---- 日志 ----
+    # 必须显式配置：Python 的 root logger 默认 WARNING 且没有 handler，
+    # 项目里成片的 logger.info 会被静默丢掉。
+    # 用 Literal 而不是 str：级别名拼错时在启动阶段就报错，
+    # 而不是等到线上发现"日志怎么没了"
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # json：一行一个 JSON，供 Loki / ELK 按字段检索；text：本地肉眼可读
+    LOG_FORMAT: Literal["json", "text"] = "json"
+
+    # ---- 指标 ----
+    # /metrics 暴露在根路径（不进 /api/v1）：Prometheus 的抓取路径是约定值，
+    # 通常由反向代理或内网限定来源，不适合对外网开放。
+    METRICS_ENABLED: bool = True
 
     # 接口与文档
     # 版本只体现在 URL 契约里，目录结构不再嵌套 v1
@@ -67,11 +82,36 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: float = 60.0
     LLM_MAX_RETRIES: int = 2
     LLM_TEMPERATURE: float = 0.7
+    # 单次回答的输出上限。**不设等于把账单的控制权交给模型**：
+    # 一个跑飞的长回答能吃掉几万 token，而用户往往看不到一半就离开了。
+    # 0 = 不限制（不推荐，仅在网关自身有硬上限时使用）。
+    LLM_MAX_TOKENS: int = 2048
 
     # 每轮对话给模型喂多少条历史消息（从数据库按会话加载）。
-    # 越长越贵，而且早期内容对当前轮次的帮助衰减得很快；
-    # 这里也是上下文窗口的第一道闸，别指望模型自己"忽略多余的"。
+    # 这是**兜底**，真正决定成本的是下面那个 token 预算：
+    # 单条消息上限 8000 字符，20 条最坏就是 4 万 token。
     CHAT_CONTEXT_MESSAGES: int = 20
+
+    # 历史上下文的总 token 预算（不含本轮提问）。超出就从最旧的开始丢。
+    # 预算的作用是让"最坏情况"可计算：无论用户怎么聊，喂进去的历史
+    # 都不会超过这个量，成本上限因此是已知的。
+    CHAT_CONTEXT_MAX_TOKENS: int = 3000
+
+    # ---- 对话成本闸门 ----
+    # 只校验 JWT 是不够的：一个账号可以无限并发、无限长输出。
+    # LLM 服务最典型的被打爆方式不是 DDoS，是账单。
+    # 每用户每分钟最多发起几轮对话（含流式与非流式）
+    CHAT_RATE_LIMIT_PER_MINUTE: int = 10
+    # 每用户同时在途的生成数。超过就 429，而不是排队 ——
+    # 排队会让用户以为"卡住了"，而他其实只是开了太多标签页。
+    CHAT_MAX_CONCURRENT_STREAMS: int = 2
+    # 单条流最长占用一个并发名额多久（秒）。进程崩溃时名额靠它自然释放，
+    # 否则每崩一次就永久少一个名额，"重启才能恢复"。
+    CHAT_INFLIGHT_TTL_SECONDS: int = 900
+    # 每用户每日 token 预算（输入 + 输出）。0 = 不限制。
+    # 请求前检查、完成后累加：这是"防止跑飞"的护栏，不是精确计费 ——
+    # 精确计费必须走数据库用量表，Redis 计数会在重启/过期时丢。
+    CHAT_DAILY_TOKEN_BUDGET: int = 200_000
 
     # ---- 提示词 ----
     # 正文是内容、不是代码，所以放在仓库根的 prompts/ 而不是 app/ 包里：

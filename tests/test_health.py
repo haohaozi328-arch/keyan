@@ -178,3 +178,26 @@ def test_readiness_never_checks_llm_by_calling_upstream(
 
     assert response.json()["data"]["checks"]["llm"] == "ok"
     assert chain.calls == [], "就绪探针不应触发模型调用"
+
+
+# ------------------------------------------------------------------ 指标
+
+
+def test_metrics_endpoint_serves_prometheus_text(client: TestClient) -> None:
+    """`/metrics` 走标准文本格式，**不套**统一响应外壳。
+
+    它挂在根路径而不是 /api/v1：抓取路径是运维侧的约定值，
+    改 API 版本不该让所有 scrape 配置一起失效。
+    """
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    body = response.text
+
+    # 业务指标：在途流与首字延迟是这套系统最该被盯的两个数
+    assert "chat_streams_inflight" in body
+    assert "chat_first_token_seconds" in body
+    assert "chat_turn_duration_seconds" in body
+    # HTTP 指标：标签是路由模板，不是原始路径（否则会话 ID 会撑爆序列数）
+    assert "http_requests_total" in body

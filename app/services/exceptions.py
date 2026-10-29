@@ -73,6 +73,32 @@ class StreamNotConfiguredError(ServiceError):
         super().__init__("流式对话需要 Redis：请设置 REDIS_PASSWORD 后重启服务")
 
 
+class ChatRateLimitedError(ServiceError):
+    """成本闸门拦下的请求：频率超限 / 在途流太多 / 当日 token 预算用尽。
+
+    一律 429。三种情况的客户端动作完全一样（等一会儿再来），
+    区别只写进 message，让人看得懂"是刷太快还是额度用完了"。
+    """
+
+    default_code = ErrorCode.CHAT_RATE_LIMITED
+
+    def __init__(self, message: str = "对话请求过于频繁，请稍后再试") -> None:
+        super().__init__(message)
+
+
+class ChatGateUnavailableError(ServiceError):
+    """没配 Redis：成本闸门的计数器无处可放。
+
+    **fail-closed**，不降级成"不限制" —— 一个"Redis 没配就没有限流"的系统，
+    出问题时第一反应就是把 Redis 摘掉，限流随之静默消失，而这不会报任何错。
+    """
+
+    default_code = ErrorCode.SERVICE_UNAVAILABLE
+
+    def __init__(self) -> None:
+        super().__init__("对话需要 Redis（限流与额度计数）：请设置 REDIS_PASSWORD 后重启服务")
+
+
 # --------------------------------------------------------------------- 鉴权
 
 
