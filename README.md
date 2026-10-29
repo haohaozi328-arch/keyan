@@ -87,6 +87,7 @@ sr/
 ├── deploy/                  # 容器侧配置（MySQL / Redis 的 cnf 与初始化脚本）
 ├── docs/                    # 本目录文档
 ├── prompts/                 # 提示词正文（内容资产，不进代码包）
+├── frontend/                # 启学聊天前端（Vue 3 + Vite，开发端口 4318）
 ├── web/                     # 零构建联调页（VAPTCHA 单点 + 全链路）
 ├── docker-compose.yml       # MySQL 8.4 LTS + Redis 7.4（--profile app 时多一个应用容器）
 ├── Dockerfile               # 应用镜像：多阶段构建、非 root、tini 接管 PID 1
