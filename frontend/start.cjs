@@ -16,4 +16,8 @@ const urls = listenAddresses(host, port, tls ? 'https' : 'http'), url = urls[0];
 createServer({ tls }).listen(port, host, () => {
   console.log(`\nQixue: ${urls.join('\n       ')}\nBackend: ${process.env.BACKEND_URL || 'http://127.0.0.1:8000'}\nKeep this window open. Ctrl+C to stop.\n`);
   if (process.platform === 'win32') { const p = spawn('explorer.exe', [url], { stdio: 'ignore', windowsHide: true }); p.on('error', () => {}); p.unref(); }
-}).on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'Port in use. Open the existing page or set FRONTEND_PORT.' : 'Cannot start frontend.'); process.exitCode = 1; });
+}).on('error', e => {
+  if (e.code === 'EADDRINUSE') console.error(`Port ${port} is in use — another instance is probably already running. Open http://127.0.0.1:${port}, stop that instance, or set FRONTEND_PORT to another port.`);
+  else console.error('Cannot start frontend: ' + e.message);
+  process.exitCode = 1;
+});

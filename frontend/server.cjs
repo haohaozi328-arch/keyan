@@ -81,5 +81,9 @@ if (require.main === module) {
   const host = process.env.FRONTEND_HOST || '127.0.0.1';
   createServer({ tls }).listen(port, host, () => {
     console.log(listenAddresses(host, port, tls ? 'https' : 'http').map((u, i) => (i ? ' '.repeat(17) : 'Qixue frontend: ') + u).join('\n'));
-  }).on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'Port in use. Set FRONTEND_PORT to another port.' : 'Cannot start frontend server.'); process.exitCode = 1; });
+  }).on('error', e => {
+    if (e.code === 'EADDRINUSE') console.error(`Port ${port} is in use — another instance is probably already running. Stop it, or set FRONTEND_PORT to another port.`);
+    else console.error('Cannot start frontend server: ' + e.message);
+    process.exitCode = 1;
+  });
 }
