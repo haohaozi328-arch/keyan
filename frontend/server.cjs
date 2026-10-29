@@ -19,7 +19,10 @@ function createServer(options = {}) {
   const send = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
   const handler = (req, res) => {
     const origin = `${tls ? 'https' : 'http'}://${req.headers.host}`;
-    res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
+    // Referrer-Policy 必须保留 origin：VAPTCHA 的 config 接口靠 Referer/Origin 识别站点，
+    // 设成 no-referrer 会让它回 code 9（当前网站未授权），人机验证直接不可用。
+    // strict-origin-when-cross-origin 是浏览器默认值：跨源只带 origin，不带 path 与 query。
+    res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://*.vaptcha.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.vaptcha.com; connect-src 'self' https://*.vaptcha.com; frame-src https://*.vaptcha.com; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(req.headers.host || '') || (req.headers.origin && req.headers.origin !== origin)) return send(res, 403, { code: 10403, message: '请从本机页面访问。', data: null });
     if (req.url.startsWith('/api/v1/') && ['GET', 'POST', 'PATCH', 'DELETE'].includes(req.method)) {

@@ -1445,6 +1445,19 @@ certutil -addstore -user Root cert.cer   # 删除：certutil -delstore -user Roo
 
 导入后**关掉整个浏览器再打开**（同一个标签页刷新可能还沿用旧的证书判定），页面顶部的「连接配置」应该显示 `安全上下文正常 / isSecureContext=是 / crypto.subtle 可用`。这条诊断是页面自带的，绿了再去点人机验证。
 
+**Vue 前端用 `server.cjs` 时，别把 Referrer-Policy 设成 `no-referrer`**
+
+`frontend/server.cjs` 起初给所有响应设了 `Referrer-Policy: no-referrer`，结果 VAPTCHA 的 config 接口（`https://v4c.vaptcha.com/api/config?v=1&d=...`）收不到 `Referer`，上游回 `code 9`，SDK 抛「当前网站未授权」，注册和发码一起废掉。
+
+判定链条只有四步，按这个顺序查最快：
+
+1. 页面响应头是 `Referrer-Policy: no-referrer`；
+2. 于是 config 请求的 `Referer` 是空字符串（DevTools Network 里能看到）；
+3. 上游返回 `{"code":9}` —— SDK 里 `9` 硬编码成「当前网站未授权」（`8` 是验证单元不存在，`10` 是未启用）；
+4. 用 `curl` 带上 `Referer: https://127.0.0.1:4318/` 重放同一个 `d` 参数，会得到 `{"code":0,"msg":"success"}`，反证域名本身是通的。
+
+改成 `strict-origin-when-cross-origin`（浏览器默认值，跨源只带 origin、不带 path 与 query）即可。**`vite dev` 没设这个头，只有 `node server.cjs` 会踩**，所以症状是"开发环境人机验证正常、build 之后必失败"，很容易误判成平台侧白名单问题。
+
 **Edge 兼容：强制内嵌验证，不弹独立窗口**
 
 SDK 在 PC 上默认走 `window.open` 弹一个验证窗口，由父页面用 `postMessage` 把初始化数据（boot）递进去。Edge 里这条通道不成立：窗口能打开、标题也渲染出来，但一直停在「验证准备中…」，既不画图也不报错——本质是那个窗口没收到 boot（单独打开 `verify.html` 也是同一现象，它的 `postMessage` 找不到 opener）。
